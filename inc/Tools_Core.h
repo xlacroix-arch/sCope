@@ -192,16 +192,9 @@ void TlsMainHeapClose(void);
 
 /*________________________________________________________________________
  |
- | Basic data structure components 
+ | Extra components
  |________________________________________________________________________
 */
-
-typedef struct TlsList TlsList;
-struct TlsList { TlsList *n; };
-extern TlsList TlsListEnd;
-
-typedef struct TlsDList TlsDList;
-struct TlsDList { TlsDList *p,*n; };
 
 typedef struct TlsBNod TlsBNod;
 #define TlsBNodEnd ((TlsBNod *)(0))

@@ -1,5 +1,5 @@
 /*  Fondement Michtam
- *  Copyright (C) 2026 <AI> Claude
+ *  Copyright (C) 2024 Xavier Lacroix
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -15,14 +15,14 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
- 
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <Tools_Core.h>
 #include <Tools_Chunk.h>
 #include <Tools_Core_Debug.h>
- 
+
 /*_____________________________________________________________________________
  |
  | The main pool: a TlsMemPool that serves every size, through a table of
@@ -74,6 +74,8 @@
  | given back. A small bucket that allocates and frees around a chunk boundary
  | does not thrash. Big chunks are given back at once: a spare there would pin
  | too much memory per class (see Tools_MainPool.Policies.md).
+ | The bins and the Full list are TlsDList heads (circular sentinels); a Slab
+ | is on one of them thru its List component, and on none when it is the Spare.
  |
  | Chunks, and the blocks of the large buckets, come from a TlsChunkSource
  | (Tools_Chunk.h): the arena of Tools_ChunkArena.c by default, which places
@@ -82,7 +84,7 @@
  | it is closed.
  |_____________________________________________________________________________
 */
- 
+
 #define SmallMax (1u<<22)                   /* last size served thru the class table */
 #define MaxClasses 400
 #define BigStep 0x10000u                    /* granularity above SmallMax */
@@ -97,21 +99,21 @@
 #define PowChunkMax (1u<<20)                /* and their chunks are at most this */
 #define PowObjs 32                          /* objects per chunk of a power of 2 (16 if too big) */
 #define SpareMaxChunk 16384                 /* chunks up to this size keep a spare */
- 
+
 /* Nmin by chunk size 2^k, k=KMin..KMax: objects per chunk, at least. */
 static const unsigned char NminOf[KMax-KMin+1] = {12,12,12,12,12,12,12,12,12,11,10,8,8};
- 
+
 static void Crit(char *Msg) {
     x_(&TlsCritErrorShutdown,Signal,Msg);
     abort();
 }
- 
+
 /*_____________________________________________________________________________
  |
  | Size classes
  |_____________________________________________________________________________
 */
- 
+
 typedef struct {
     uint32_t Size;
     uint32_t Chunk;             /* 0: large bucket */
@@ -121,7 +123,7 @@ typedef struct {
 static Class Tab[MaxClasses];
 static unsigned int NTab;
 static atomic_int TabState;     /* 0 not built, 1 building, 2 built */
- 
+
 static uint32_t LowBit(uint32_t v) { return v&(-v); }
 static uint32_t MapWords(uint32_t N) { return (N+31)/32; }
 static uint32_t SlabHead(uint32_t N) { return SlabHdr+4*MapWords(N); }
@@ -202,23 +204,23 @@ unsigned int TlsMainPoolClassSize(unsigned int c) {
     ClassTableEnsure();
     return Tab[c].Size;
 }
- 
+
 /*_____________________________________________________________________________
  |
  | Structures
  |_____________________________________________________________________________
 */
- 
+
 typedef struct MainPool MainPool;
 typedef struct Slab Slab;
 struct Slab {                   /* header of a chunk, at its tail */
-    Slab *n,*p;                 /* bin list or Full list */
+    TlsDList of_(Slab.List) List;   /* in a bin or in Full; in none when it is the Spare */
     uint32_t nfree;
     uint32_t hint;              /* no free object in the bitmap words below */
     uint16_t bin;               /* bin it is listed in, when not full/spare */
 };
 _Static_assert(sizeof(Slab)<=SlabHdr,"Slab header size");
- 
+
 typedef struct Bucket {
     TlsMemPool TlsMemPool;
     MainPool *Pool;
@@ -228,10 +230,11 @@ typedef struct Bucket {
     uint32_t Align;             /* alignment of the blocks */
     uint32_t Chunk,N,MapWords;  /* slab geometry, Chunk is 0 if Large */
     uint32_t binMask;
-    Slab *bins[SlabBins];
-    Slab *Full,*Spare;
+    TlsDList of_(Slab.List) bins[SlabBins];
+    TlsDList of_(Slab.List) Full;
+    Slab *Spare;
 } Bucket;
- 
+
 struct MainPool {
     Bucket Root;                /* the 0-size bucket */
     Bucket *Cls[MaxClasses];
@@ -241,13 +244,13 @@ struct MainPool {
     TlsChunkSource *Src;
     unsigned long ChunksGot,ChunksPut;
 };
- 
+
 /*_____________________________________________________________________________
  |
  | Chunks
  |_____________________________________________________________________________
 */
- 
+
 static void *ChunkGet(MainPool *P,uint32_t C) {
     P->ChunksGot++;
     return x_(P->Src,Get,C,C);
@@ -256,43 +259,43 @@ static void ChunkPut(MainPool *P,void *c,uint32_t C) {
     P->ChunksPut++;
     x_(P->Src,Put,c,C);
 }
- 
+
 /*_____________________________________________________________________________
  |
  | Slab chunk lists and bins
  |_____________________________________________________________________________
 */
- 
-static void ListAdd(Slab **head,Slab *s) {
-    s->p = 0; s->n = *head;
-    if (*head) (*head)->p = s;
-    *head = s;
+
+static void ListInit(TlsDList *h) { h->n = h->p = h; }
+static int ListEmpty(TlsDList *h) { return h->n==h; }
+static void ListAdd(TlsDList *h,TlsDList *e) {      /* e goes first after the head h */
+    e->p = h; e->n = h->n;
+    h->n->p = e; h->n = e;
 }
-static void ListDel(Slab **head,Slab *s) {
-    if (s->p) s->p->n = s->n; else *head = s->n;
-    if (s->n) s->n->p = s->p;
+static void ListDel(TlsDList *e) {
+    e->p->n = e->n; e->n->p = e->p;
 }
 static void BinAdd(Bucket *b,Slab *s) {
     unsigned int k = (unsigned int)TlsLog2(s->nfree);
     s->bin = (uint16_t)k;
-    ListAdd(&b->bins[k],s);
+    ListAdd(&b->bins[k],&s->List);
     b->binMask |= 1u<<k;
 }
 static void BinDel(Bucket *b,Slab *s) {
-    ListDel(&b->bins[s->bin],s);
-    if (!b->bins[s->bin]) b->binMask &= ~(1u<<s->bin);
+    TlsDList *h = &b->bins[s->bin];
+    ListDel(&s->List);
+    if (ListEmpty(h)) b->binMask &= ~(1u<<s->bin);
 }
- 
+
 /* The header is at the tail of the chunk, the bitmap just below it, and the
  * objects start at the base. */
 static char *SlabBase(Bucket *b,Slab *s) { return (char *)s-(b->Chunk-SlabHdr); }
 static uint32_t *SlabMap(Bucket *b,Slab *s) { return (uint32_t *)((char *)s-4*b->MapWords); }
- 
+
 static Slab *SlabNew(Bucket *b) {
     char *base = ChunkGet(b->Pool,b->Chunk);
     Slab *s = (Slab *)(base+b->Chunk-SlabHdr);
     uint32_t *m = SlabMap(b,s),i,rem = b->N&31;
-    s->n = s->p = 0;
     s->nfree = b->N;
     s->hint = 0;
     s->bin = 0;
@@ -300,21 +303,22 @@ static Slab *SlabNew(Bucket *b) {
     if (rem) m[b->MapWords-1] = (1u<<rem)-1;
     return s;
 }
- 
+
 /*_____________________________________________________________________________
  |
  | Buckets
  |_____________________________________________________________________________
 */
- 
+
 static int InRange(Bucket *b,unsigned int sz) { return ((int64_t)sz>b->Lo) && (sz<=b->Size); }
- 
+
 static void *SlabAllocate(TlsMemPool *this) {
     TlsGetThat(Bucket,TlsMemPool);
     Slab *s;
     uint32_t *m,w,idx;
     if (that->binMask) {
-        s = that->bins[__builtin_ctz(that->binMask)];       /* fullest non-full chunk */
+        TlsDList *h = &that->bins[__builtin_ctz(that->binMask)];
+        s = v_(Slab,List,h->n);                             /* fullest non-full chunk */
     } else {
         s = that->Spare;
         if (s) that->Spare = 0; else s = SlabNew(that);
@@ -329,7 +333,7 @@ static void *SlabAllocate(TlsMemPool *this) {
     s->nfree--;
     if (s->nfree==0) {
         BinDel(that,s);
-        ListAdd(&that->Full,s);
+        ListAdd(&that->Full,&s->List);
     } else if ((unsigned int)TlsLog2(s->nfree)!=s->bin) {
         BinDel(that,s);
         BinAdd(that,s);
@@ -360,7 +364,7 @@ static void SlabFree(TlsMemPool *this,void *mem,unsigned int sz) {
     if (w<s->hint) s->hint = w;
     x_(that->Pool->Count,Add,-(int)that->Size);
     if (s->nfree==0) {                      /* was full: back in the bins */
-        ListDel(&that->Full,s);
+        ListDel(&s->List);
         s->nfree = 1;
         BinAdd(that,s);
     } else if (s->nfree+1==that->N) {       /* is empty: keep one spare (small tiers), release the others */
@@ -376,7 +380,7 @@ static void SlabFree(TlsMemPool *this,void *mem,unsigned int sz) {
         }
     }
 }
- 
+
 static void *LargeAllocate(TlsMemPool *this) {
     TlsGetThat(Bucket,TlsMemPool);
     void *r;
@@ -397,11 +401,12 @@ static void LargeFree(TlsMemPool *this,void *mem,unsigned int sz) {
     if (that->Size) x_(that->Pool->Src,Put,mem,that->Size);
     else free(mem);
 }
- 
+
 static struct TlsMemPool SlabStatic,LargeStatic;
- 
+
 static Bucket *BucketNew(MainPool *P,uint32_t Size,int64_t Lo,uint32_t Chunk,uint32_t N,uint32_t Align) {
     Bucket *b = calloc(1,sizeof(*b));
+    int i;
     if (!b) Crit("Out of Memory");
     b->Pool = P;
     b->Size = Size;
@@ -410,12 +415,14 @@ static Bucket *BucketNew(MainPool *P,uint32_t Size,int64_t Lo,uint32_t Chunk,uin
     b->Chunk = Chunk;
     b->N = N;
     b->MapWords = MapWords(N);
+    for (i=0;i<SlabBins;i++) ListInit(&b->bins[i]);
+    ListInit(&b->Full);
     b->TlsMemPool.Static = Chunk ? &SlabStatic : &LargeStatic;
     b->Next = P->All;
     P->All = b;
     return b;
 }
- 
+
 static TlsMemPool *MainSizeSelect(TlsMemPool *this,unsigned int sz) {
     TlsGetThat(Bucket,TlsMemPool);
     MainPool *P = that->Pool;
@@ -445,8 +452,14 @@ static unsigned int MainBucketSize(TlsMemPool *this) {
     TlsGetThat(Bucket,TlsMemPool);
     return that->Size;
 }
-static void ReleaseList(Bucket *b,Slab *s) {
-    while (s) { Slab *n = s->n; ChunkPut(b->Pool,SlabBase(b,s),b->Chunk); s = n; }
+/* Gives back the chunks of the slabs on the list h. */
+static void ReleaseList(Bucket *b,TlsDList *h) {
+    TlsDList *e = h->n;
+    while (e!=h) {
+        TlsDList *n = e->n;
+        ChunkPut(b->Pool,SlabBase(b,v_(Slab,List,e)),b->Chunk);
+        e = n;
+    }
 }
 static void MainClose(TlsMemPool *this) {
     TlsGetThat(Bucket,TlsMemPool);
@@ -455,8 +468,8 @@ static void MainClose(TlsMemPool *this) {
     for (b=P->All;b;b=n) {
         int i;
         n = b->Next;
-        for (i=0;i<SlabBins;i++) ReleaseList(b,b->bins[i]);
-        ReleaseList(b,b->Full);
+        for (i=0;i<SlabBins;i++) ReleaseList(b,&b->bins[i]);
+        ReleaseList(b,&b->Full);
         if (b->Spare) ChunkPut(P,SlabBase(b,b->Spare),b->Chunk);
         free(b);
     }
@@ -475,14 +488,14 @@ static TlsIntCounter *MainCountSwitch(TlsMemPool *this,TlsIntCounter *Swp) {
     }
     return r;
 }
- 
+
 static struct TlsMemPool SlabStatic = {
     SlabAllocate,SlabFree,MainSizeSelect,MainBucketSize,MainClose,MainCountSwitch
 };
 static struct TlsMemPool LargeStatic = {
     LargeAllocate,LargeFree,MainSizeSelect,MainBucketSize,MainClose,MainCountSwitch
 };
- 
+
 /* Count is where the allocated bytes are accounted (NULL: nowhere). */
 TlsMemPool *TlsMainPoolOpenWith(TlsIntCounter *Count,TlsChunkSource *Src) {
     MainPool *P = calloc(1,sizeof(*P));
@@ -500,13 +513,13 @@ TlsMemPool *TlsMainPoolOpenWith(TlsIntCounter *Count,TlsChunkSource *Src) {
 TlsMemPool *TlsMainPoolOpen(TlsIntCounter *Count) {
     return TlsMainPoolOpenWith(Count,TlsChunkSourceArena());
 }
- 
+
 /*_____________________________________________________________________________
  |
  | Introspection, for tests.
  |_____________________________________________________________________________
 */
- 
+
 void TlsMainPoolChunkStats(TlsMemPool *this,unsigned long *got,unsigned long *put) {
     TlsGetThat(Bucket,TlsMemPool);
     *got = that->Pool->ChunksGot;
@@ -524,4 +537,3 @@ unsigned int TlsMainPoolAlign(TlsMemPool *this) {
     TlsGetThat(Bucket,TlsMemPool);
     return that->Align;
 }
-

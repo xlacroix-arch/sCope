@@ -484,8 +484,8 @@ static void *AlignItemAllocate(AlignPool *that,unsigned int cSz) {
     while ((p->Free==0)&&(p<e)) { p++; }
     if (p->Free==0) {
         void *ck;
-        int ppSz = pckd.CntnSz;
-        ck = x_(&that->MainBuck[ppSz-8].Pool.TlsMemPool,Allocate);
+        TlsMemPool *MemPool= &that->MainBuck[pckd.CntnSz-8].Pool.TlsMemPool;
+        ck = x_(MemPool,Allocate);
         r = AlignPartition(that,pckd,ck);
     } else {
         TlsDList *P;

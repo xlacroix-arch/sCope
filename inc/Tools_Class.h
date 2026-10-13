@@ -40,6 +40,41 @@
 #define c_(t,d,p) (((char *)(&(((struct c_##t *)0)->d.p)))-((char *)(&((struct c_##t *)0)->d)))
 #define v_(t,d,p) ((t *)(((char *)(p))-o_(t,d)))
 
+/*________________________________________________________________________
+ |
+ | Basic data structure components:
+ |
+ | Use these components to build your overall data structures.
+ | Embed them in your structures, operate them using member pointers,
+ | and use v_() to retrieve the embedding variable.
+ | structure.
+ | When embedding them in structure, it is customary to hint at their 
+ | connection. Use the of_() macro to do so.
+ |
+ | example:
+ | typedef struct TlsDList TlsDList;
+ | struct TlsDList { TlsDList *p,*n; }; 
+ |
+ | typedef struct {
+ |     TlsDList of_(PointList.List) List;
+ |     struct Point{int x[3];} x;
+ | } PointList;
+ | typedef struct {
+ |     TlsDList of_(PolygonList.List) List;
+ |     TlsDList of_(PointList.List) Polygon;
+ | } PolygonList;
+ |________________________________________________________________________
+*/
+
+#define of_(spec_type) /**/
+
+typedef struct TlsList of_(x) TlsList of_(x);
+struct TlsList of_(x) { TlsList of_(x) *n; };
+extern TlsList TlsListEnd;
+
+typedef struct TlsDList TlsDList;
+struct TlsDList { TlsDList *p,*n; };
+
 /*_______________________________________________________________________
  |
  | Class(t) is a typedef structure 't' with a pointer to a static 

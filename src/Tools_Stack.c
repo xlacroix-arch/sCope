@@ -82,15 +82,17 @@ typedef struct noPool {
 static void *noPoolAllocate(TlsMemPool *this) {
     TlsGetThat(noBucket,TlsMemPool);
     void *r = malloc(that->sz?that->sz:1);      /* a 0 size still gets a valid pointer */
+    TlsIntCounter *SzCount = that->Pool->SzCount;
     if (!r) CritErrorExit(0,"Out of memory.");
-    x_(that->Pool->SzCount,Add,(int)that->sz);
+    x_(SzCount,Add,(int)that->sz);
     return r;
 }
 static void noPoolFree(TlsMemPool *this,void *mem,unsigned int sz) {
     TlsGetThat(noBucket,TlsMemPool);
+    TlsIntCounter *SzCount = that->Pool->SzCount;
     if (that->sz!=sz)                           /* not the bucket that allocated */
         that = v_(noBucket,TlsMemPool,x_(this,SizeSelect,sz));
-    x_(that->Pool->SzCount,Add,-(int)that->sz);
+    x_(SzCount,Add,-(int)that->sz);
     free(mem);
 }
 static TlsMemPool *noPoolSizeSelect(TlsMemPool *this,unsigned int sz) {
@@ -263,7 +265,8 @@ TlsMemPool *TlsStackPool(TlsStack *s) { return s->Pool; }
  * case) share the handle found last. */
 static TlsMemPool *StackBlockBucket(TlsStack *s,unsigned int sz) {
     if (s->Blk.sz!=sz || !s->Blk.h) {
-        s->Blk.h = x_(s->Pool,SizeSelect,sz);
+        TlsMemPool *Pool=s->Pool;
+        s->Blk.h = x_(Pool,SizeSelect,sz);
         s->Blk.sz = sz;
     }
     return s->Blk.h;
@@ -351,9 +354,12 @@ typedef struct StackRoot {
         TlsStackNod *Nod;
     } Bottom;
 } StackRoot;
-static void StackIntrnPoolClose(struct StackRoot *s) { x_(s->TlsStack.Pool,Close); }
+static void StackIntrnPoolClose(struct StackRoot *s) { 
+    TlsMemPool *Pool=s->TlsStack.Pool; x_(Pool,Close); 
+}
 static void StackExtrnPoolClose(struct StackRoot *s) {
-    x_(s->TlsStack.Chunks,Free,s->Bottom.Chunk,s->TlsStack.growth);
+    TlsMemPool *Chunks=s->TlsStack.Chunks;
+    x_(Chunks,Free,s->Bottom.Chunk,s->TlsStack.growth);
 }
 /* The first chunk, the root structure (and the pool when there is none) are
  * all in the first block:  [chunk header][noPool, counter][StackRoot] ... */
@@ -394,17 +400,20 @@ TlsStack *TlsStackOpen(TlsMemPool *Pool,unsigned int growth,TlsIntCounter *Watch
 }
 void TlsStackClose(TlsStack *Stck) {
     StackRoot *Rt;
+    TlsIntCounter *MemWatch=Stck->MemWatch;
     Rt = v_(StackRoot,TlsStack,Stck);
     TlsStackLayerPop(Stck,Rt->Bottom.Nod);
-    x_(Stck->MemWatch,Add,-(int)Stck->growth);
+    x_(MemWatch,Add,-(int)Stck->growth);
     Rt->PoolClose(Rt);
 }
 
 static void StackGrow(TlsStack *s) {
-    x_(s->MemWatch,Add,s->growth>>MemAtomShift);
+    TlsIntCounter *MemWatch=s->MemWatch;
+    x_(MemWatch,Add,s->growth>>MemAtomShift);
     void *p,*b;
     StackChunk *c;
-    b = StackChunkCheck(x_(s->Chunks,Allocate));
+    TlsMemPool *Chunks=s->Chunks;
+    b = StackChunkCheck(x_(Chunks,Allocate));
     c = b; p = c+1;
     c->p.n = &s->Top.Chunk->p;
     c->Elts.next = 0;
@@ -432,9 +441,12 @@ static int StackChunkReleased(TlsStack *s,struct TlsStackNod *End) {
         switch (elt.x.type) {
         case c_(loc,Stack.Type,Layer): break;
         case c_(loc,Stack.Type,Block): {
+            TlsMemPool *MemPool;
             ChunkPartBlock *p = v_(ChunkPartBlock,next,n);
-            x_(s->MemWatch,Add,-(int)(p->sz>>MemAtomShift));
-            x_(StackBlockBucket(s,p->sz),Free,p->base,p->sz);
+            TlsIntCounter *MemWatch=s->MemWatch;
+            x_(MemWatch,Add,-(int)(p->sz>>MemAtomShift));
+            MemPool=StackBlockBucket(s,p->sz);
+            x_(MemPool,Free,p->base,p->sz);
         } break;
         case c_(loc,Stack.Type,Stack): {
             ChunkPartStack *ps = v_(ChunkPartStack,next,n);
@@ -459,11 +471,13 @@ int TlsStackLayerPop(TlsStack *s,TlsStackNod *End) {
 #endif
     while (s->Top.Chunk!=&StackChunkEnd) {
         StackChunk *chunk;
+        TlsIntCounter *MemWatch=s->MemWatch;
+        TlsMemPool *Chunks=s->Chunks;
         if (!StackChunkReleased(s,End)) return 1;
         chunk = s->Top.Chunk;
-        x_(s->MemWatch,Add,-(int)(s->growth>>MemAtomShift));
+        x_(MemWatch,Add,-(int)(s->growth>>MemAtomShift));
         s->Top.Chunk = v_(StackChunk,p,chunk->p.n);
-        x_(s->Chunks,Free,chunk,s->growth);
+        x_(Chunks,Free,chunk,s->growth);
     }
     s->Top.offset = s->growth;
     return 0;
@@ -486,11 +500,14 @@ TlsStackNod *TlsStackLayer(TlsStack *Stack) {
 static void *StackPushBlock(TlsStack *Stack,unsigned int sz) {
     ChunkPartBlock *r;
     xpdStackNod n;
+    TlsMemPool *MemPool;
+    TlsIntCounter *MemWatch=Stack->MemWatch;
     n.type = c_(loc,Stack.Type,Block);
     sz = MemAtomAlign(sz);
     r = PushNod(Stack,sizeof(*r));
-    x_(Stack->MemWatch,Add,sz>>MemAtomShift);
-    r->base = x_(StackBlockBucket(Stack,sz),Allocate);
+    x_(MemWatch,Add,sz>>MemAtomShift);
+    MemPool = StackBlockBucket(Stack,sz);
+    r->base = x_(MemPool,Allocate);
     r->sz = sz;
     r->next.next = Stack->Top.Chunk->Elts.next;
     n.next = StackNodOffset(Stack,&r->next);
