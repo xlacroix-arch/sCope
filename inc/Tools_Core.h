@@ -115,6 +115,13 @@ TlsClassDef(TlsMemPool) {
     TlsIntCounter *(*CountSwitch)(TlsMemPool *this,TlsIntCounter *Swp);
 };
 
+/* Specialisations and filters: */
+
+/* Make a child Pool thread safe to use: */
+TlsMemPool *TlsMemPoolShared(TlsMemPool *child);
+/* Buffer items instead of releasing them, to limit access to the child*/
+TlsMemPool *TlsMemPoolBuffered(TlsMemPool *child,unsigned int buffersize);
+
 /*_____________________________________________________________________________
  |
  | Stack:
