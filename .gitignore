@@ -1,0 +1,10 @@
+**/obj
+**/lib
+**.swp
+/fiber_test
+/Tools_Core.Test
+/Tools_Fiber_test
+/Tools_List.Test
+/Tools_MemPoolFilters.Test
+/Tools_Gate.Test
+/Tools_Gate.Thread.Test

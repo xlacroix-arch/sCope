@@ -18,6 +18,7 @@ obj/Tools_Stack.o : $(Tools_h)
 obj/Tools_List.o : $(Tools_h)
 obj/Tools_Fiber.o : $(Tools_h)
 obj/Tools_MemPool.o : $(Tools_h)
+obj/Tools_Gate.o : $(Tools_h) Tools_Gate.h
 obj/Tools_ChunkArena.o : $(Tools_h) Tools_Chunk.h
 obj/Tools_MainPool.o : $(Tools_h) Tools_Chunk.h
 obj/Tools_MemPoolFilters.o : $(Tools_h)
@@ -25,6 +26,8 @@ obj/Tools_MemPoolFilters.o : $(Tools_h)
 obj/Tools_Fiber_test.o : $(Tools_h)
 
 obj/Tools_MainPool.Test.o : $(Tools_h)
+obj/Tools_Gate.Test.o : $(Tools_h) Tools_Gate.h
+obj/Tools_Gate.Test.Thread.o : $(Tools_h) Tools_Gate.h MallocPool.h
 obj/Tools_ChunkArena.Test.o : $(Tools_h) Tools_Chunk.h
 obj/Tools_Core.Test.o : $(Tools_h)
 obj/Tools_List.Test.o : $(Tools_h)
@@ -34,6 +37,10 @@ obj/fiber.o : $(Tools_h) fiber.h
 obj/fiber_test.o : fiber.h $(Tools_h)
 
 
+Tools_Gate.Test : Tools_Core.h obj/Tools_Gate.Test.o $(Tools_o)
+	gcc -o Tools_Gate.Test obj/Tools_Gate.Test.o $(Tools_o)
+Tools_Gate.Thread.Test : Tools_Core.h obj/Tools_Gate.Thread.Test.o $(Tools_o)
+	gcc -o Tools_Gate.Thread.Test obj/Tools_Gate.Thread.Test.o $(Tools_o)
 Tools_MemPoolFilters.Test : Tools_Core.h obj/Tools_MemPoolFilters.Test.o $(Tools_o)
 	gcc -o Tools_MemPoolFilters.Test obj/Tools_MemPoolFilters.Test.o $(Tools_o)
 Tools_Core.Test : Tools_Core.h obj/Tools_Core.Test.o $(Tools_o)
@@ -47,7 +54,7 @@ fiber_test : obj/fiber_test.o $(Tools_o)
 
 .PHONY : all
 all : $(Tools_o) \
-Tools_Core.Test Tools_List.Test fiber_test Tools_Fiber_test Tools_MemPoolFilters.Test
+Tools_Core.Test Tools_List.Test fiber_test Tools_Fiber_test Tools_MemPoolFilters.Test Tools_Gate.Thread.Test Tools_Gate.Test
 
 .PHONY : clean
 clean:
