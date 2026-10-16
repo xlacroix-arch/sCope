@@ -309,6 +309,7 @@ static __thread TlsGate *Self_;
  
 void TlsGateSharedSet(TlsMemPool *Shared) { SharedPool_ = Shared; }
 TlsGate *TlsGateSelf(void) { return Self_; }
+void TlsGateSelfSet(TlsGate *g) { Self_ = g; }
  
 typedef struct {
     Gate G;

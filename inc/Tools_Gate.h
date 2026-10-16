@@ -1,3 +1,4 @@
+
 /*  Fondement Michtam
  *  Copyright (C) 2026 Xavier Lacroix
  *  GPL v2 or later, see the other Tools_ files.
@@ -109,6 +110,9 @@ TlsClassDef(TlsGateEntry) {
 };
 void TlsGateSharedSet(TlsMemPool *Shared);
 TlsGate *TlsGateSelf(void);
+/* For a thread that is not made by TlsGateSet (the main thread, see Tools_Main.h):
+ * declares the gate it serves, so that the threads it spawns get it as Parent. */
+void TlsGateSelfSet(TlsGate *g);
 TlsGate *TlsGateSet(int StackSize,TlsGateEntry *Entry);
  
 #endif
