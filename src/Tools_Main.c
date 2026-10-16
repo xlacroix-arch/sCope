@@ -52,14 +52,11 @@ typedef struct {
     int Result;
 } Run;
  
-/* The first process of the main thread. */
+/* The first process of the main thread. It has no gate: it is the root of the
+ * tree of threads (TlsGateUp() is NULL). */
 static void MainProc(void *arg) {
     Run *r = arg;
-    TlsGate *g = TlsGateOpen();
-    TlsGateSelfSet(g);
     r->Result = r->app(r->argc,r->argv);
-    x_(g,Shutdown);                         /* requests still waiting are refused */
-    TlsGateSelfSet(0);
 }
  
 int TlsMainRun(const TlsMainConfig *cfg,int argc,char **argv,int (*app)(int,char **)) {

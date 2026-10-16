@@ -50,24 +50,40 @@ static const GateSync *SyncOps = &FutexSync;
  | Side tells what f holds: 0 P, 1 the client process, 2 the server context.
  |_____________________________________________________________________________
  */
-typedef struct Gate Gate;
+typedef struct End End;
 struct TlsGateNod {
     fiber f;
     TlsGateGuest *Guest;                    /* the mailbox: what the resumer passes */
     TlsGateNod *Next;                       /* link in the inbox of a gate */
-    Gate *Out;                              /* request to hand over, for P */
+    End *Out;                               /* request to hand over, for P */
     atomic_uint Word;                       /* 1: P must resume the client process */
     int Side;
     void (*BootFn)(void *);
     void *BootArg;
 };
-struct Gate {
-    TlsGate TlsGate;
-    _Atomic(TlsGateNod *) Head;             /* inbox, newest first; SHUT once shut */
+/* What a thread sleeps on when it serves gates: one per thread, shared by all
+ * the inboxes it serves, so that it can wait on several ends at once. */
+typedef struct {
     atomic_uint Seq;                        /* changes at each arrival */
     atomic_uint Sleeping;                   /* the server is about to sleep on Seq, or does */
+} Waker;
+/* A gate is an edge between two threads, and a TlsGate is one end of it. Each
+ * end has an inbox: the requests addressed to it. Knock on an end posts to the
+ * inbox of its Peer; Check, Wait and Invite serve the inbox of the end itself.
+ * The loopback gate of TlsGateOpen is an end that is its own Peer. */
+struct End {
+    TlsGate TlsGate;
+    End *Peer;
+    _Atomic(TlsGateNod *) Head;             /* inbox, newest first; SHUT once shut */
+    Waker *W;                               /* who sleeps for this inbox */
     TlsGateNod *Ready;                      /* server only: pulled, oldest first */
 };
+static void EndInit(End *e,End *peer,Waker *w) {
+    e->Peer = peer;
+    atomic_init(&e->Head,0);
+    e->W = w;
+    e->Ready = 0;
+}
 #define SHUT ((TlsGateNod *)1)
  
 TlsGateEnd TlsGateEndShutdown = {{0},1};
@@ -143,17 +159,17 @@ void TlsGateGuestSendOff(TlsGateGuest *Target) {
  
 /* Hands the request of the parked client to the gate. Runs on the parking
  * fiber, after the client process is safely parked in n->f. */
-static void Publish(Gate *g,TlsGateNod *n) {
+static void Publish(End *g,TlsGateNod *n) {
     TlsGateNod *h = atomic_load_explicit(&g->Head,memory_order_relaxed);
     do {
         if (h==SHUT) { Release(n,EndShut); return; }
         n->Next = h;
     } while (!atomic_compare_exchange_weak_explicit(&g->Head,&h,n,
                 memory_order_release,memory_order_relaxed));
-    atomic_fetch_add_explicit(&g->Seq,1,memory_order_release);
+    atomic_fetch_add_explicit(&g->W->Seq,1,memory_order_release);
     atomic_thread_fence(memory_order_seq_cst);          /* pairs with the one in Wait */
-    if (atomic_load_explicit(&g->Sleeping,memory_order_relaxed))
-        SyncOps->Wake(&g->Seq);             /* a busy server is not woken */
+    if (atomic_load_explicit(&g->W->Sleeping,memory_order_relaxed))
+        SyncOps->Wake(&g->W->Seq);          /* a busy server is not woken */
 }
  
 static void HomeBoot(fiber *parent) {
@@ -181,7 +197,7 @@ void TlsGateHomeRun(TlsGateNod *n,unsigned stack_sz,void (*fn)(void *),void *arg
     r = fiber_launch(&st,HomeBoot,&n->f);
     assert(r && "the process could not be bootstrapped");
     while (n->f.caller) {                   /* else the process is over */
-        Gate *g = n->Out;
+        End *g = n->Out;
         assert(g && "parking fiber resumed without a request");
         n->Out = 0;
         Publish(g,n);
@@ -195,19 +211,20 @@ void TlsGateHomeRun(TlsGateNod *n,unsigned stack_sz,void (*fn)(void *),void *arg
  
 /*_____________________________________________________________________________
  |
- | Gate
+ | Gate ends
  |_____________________________________________________________________________
  */
  
 static TlsGateGuest *GateKnock(TlsGate *this,TlsGateGuest *request) {
-    TlsGetThat(Gate,TlsGate);
+    TlsGetThat(End,TlsGate);
+    End *to = that->Peer;                   /* the inbox the request goes to */
     TlsGateNod *n = Home_;
     TlsHeap *mine;
     assert(n && "Knock: this thread has no home");
-    if (atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) return EndShut;
+    if (atomic_load_explicit(&to->Head,memory_order_acquire)==SHUT) return EndShut;
     request->Nod = 0;
     n->Guest = request;
-    n->Out = that;
+    n->Out = to;
     n->Side = 1;
     mine = TlsHeap_.Tgt;
     x_(mine,Sync);
@@ -217,7 +234,7 @@ static TlsGateGuest *GateKnock(TlsGate *this,TlsGateGuest *request) {
 }
  
 /* Server only: moves the arrivals to the ready list, oldest first. */
-static int Pull(Gate *g) {
+static int Pull(End *g) {
     TlsGateNod *h;
     if (g->Ready) return 1;
     h = atomic_load_explicit(&g->Head,memory_order_acquire);
@@ -232,33 +249,60 @@ static int Pull(Gate *g) {
     }
     return 0;
 }
+static int IsShut(End *g) { return atomic_load_explicit(&g->Head,memory_order_acquire)==SHUT; }
  
 static int GateCheck(TlsGate *this) {
-    TlsGetThat(Gate,TlsGate);
+    TlsGetThat(End,TlsGate);
     return Pull(that);
 }
  
-static int GateWait(TlsGate *this) {
-    TlsGetThat(Gate,TlsGate);
+/* Waits on the n ends (all served by the calling thread: one Waker) until one
+ * has a request: returns its index. Returns -1 when none has one and some end
+ * is shut: the caller finds which with IsShut, and drops it (or ends). */
+static int WaitAnyEnds(End **e,int n) {
+    Waker *w = e[0]->W;
     for (;;) {
         unsigned s;
-        if (Pull(that)) return 1;
-        if (atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) return 0;
-        s = atomic_load_explicit(&that->Seq,memory_order_acquire);
-        atomic_store_explicit(&that->Sleeping,1,memory_order_relaxed);
-        atomic_thread_fence(memory_order_seq_cst);      /* either the publisher sees Sleeping, or we see its request */
-        if (Pull(that) ||
-            atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) {
-            atomic_store_explicit(&that->Sleeping,0,memory_order_relaxed);
-            return Pull(that);              /* arrived since the first look, or shut */
+        int i;
+        for (i=0;i<n;i++) {
+            assert(e[i]->W==w && "WaitAny: the ends must be served by the same thread");
+            if (Pull(e[i])) return i;
         }
-        SyncOps->Block(&that->Seq,s);
-        atomic_store_explicit(&that->Sleeping,0,memory_order_relaxed);
+        for (i=0;i<n;i++) if (IsShut(e[i])) return -1;
+        s = atomic_load_explicit(&w->Seq,memory_order_acquire);
+        atomic_store_explicit(&w->Sleeping,1,memory_order_relaxed);
+        atomic_thread_fence(memory_order_seq_cst);      /* either the publisher sees Sleeping, or we see its request */
+        for (i=0;i<n;i++) if (Pull(e[i]) || IsShut(e[i])) break;
+        if (i<n) {                          /* arrived since the first look, or shut */
+            atomic_store_explicit(&w->Sleeping,0,memory_order_relaxed);
+            continue;
+        }
+        SyncOps->Block(&w->Seq,s);
+        atomic_store_explicit(&w->Sleeping,0,memory_order_relaxed);
     }
 }
  
+static int GateWait(TlsGate *this) {
+    TlsGetThat(End,TlsGate);
+    End *e = that;
+    return WaitAnyEnds(&e,1)==0;
+}
+ 
+int TlsGateIsShut(TlsGate *this) {
+    TlsGetThat(End,TlsGate);
+    return IsShut(that) && !that->Ready;
+}
+ 
+int TlsGateWaitAny(TlsGate **Ends,int n) {
+    End *e[16];
+    int i;
+    assert(n>=1 && n<=16 && "WaitAny: 1 to 16 ends");
+    for (i=0;i<n;i++) e[i] = v_(End,TlsGate,Ends[i]);
+    return WaitAnyEnds(e,n);
+}
+ 
 static TlsGateGuest *GateInvite(TlsGate *this) {
-    TlsGetThat(Gate,TlsGate);
+    TlsGetThat(End,TlsGate);
     TlsGateNod *n;
     if (!Pull(that)) return 0;
     n = that->Ready;
@@ -268,30 +312,45 @@ static TlsGateGuest *GateInvite(TlsGate *this) {
     return n->Guest;
 }
  
-static void GateShutdown(TlsGate *this) {
-    TlsGetThat(Gate,TlsGate);
-    TlsGateNod *h = atomic_exchange_explicit(&that->Head,SHUT,memory_order_acq_rel);
+/* Closes the inbox: what nobody served is refused, what arrives later too. */
+static void ShutInbox(End *g) {
+    TlsGateNod *h = atomic_exchange_explicit(&g->Head,SHUT,memory_order_acq_rel);
     if (h==SHUT) return;
     while (h) {
         TlsGateNod *n = h->Next;            /* before the client can reuse it */
         Release(h,EndShut);
         h = n;
     }
-    atomic_fetch_add_explicit(&that->Seq,1,memory_order_release);
-    SyncOps->Wake(&that->Seq);
+    atomic_fetch_add_explicit(&g->W->Seq,1,memory_order_release);
+    SyncOps->Wake(&g->W->Seq);
+}
+static void GateShutdown(TlsGate *this) {
+    TlsGetThat(End,TlsGate);
+    ShutInbox(that);
+}
+/* The server's own Ready list, once it will not serve it: refused too. */
+static void DrainReady(End *g) {
+    while (g->Ready) {
+        TlsGateNod *n = g->Ready;
+        g->Ready = n->Next;
+        n->Next = 0;
+        Release(n,EndShut);
+    }
 }
  
+static Waker *CurWaker(void);
 TlsGate *TlsGateOpen(void) {
     static struct TlsGate Static = {GateShutdown,GateKnock,GateCheck,GateWait,GateInvite};
-    Gate *g;
+    End *g;
     TlsHeapAlign(16);
     rPush(g);
     g->TlsGate.Static = &Static;
-    atomic_init(&g->Head,0);
-    atomic_init(&g->Seq,0);
-    atomic_init(&g->Sleeping,0);
-    g->Ready = 0;
+    EndInit(g,g,CurWaker());                /* its own peer: a loopback gate */
     return &g->TlsGate;
+}
+TlsGate *TlsGatePeer(TlsGate *this) {
+    TlsGetThat(End,TlsGate);
+    return &that->Peer->TlsGate;
 }
  
 /*_____________________________________________________________________________
@@ -305,48 +364,48 @@ TlsMemPool *TlsMemPoolBuffered(TlsMemPool *child,unsigned int buffersize);
 #define GateBuffer 65536                    /* bytes of free blocks its pool may hold */
  
 static TlsMemPool *SharedPool_;
-static __thread TlsGate *Self_;
+static __thread TlsGate *Up_;               /* the end of the edge to the parent; NULL on the main thread */
+static __thread Waker *Waker_;              /* set for the threads made by TlsGateSet */
+static __thread Waker ThreadWaker_;         /* the others */
  
 void TlsGateSharedSet(TlsMemPool *Shared) { SharedPool_ = Shared; }
-TlsGate *TlsGateSelf(void) { return Self_; }
-void TlsGateSelfSet(TlsGate *g) { Self_ = g; }
+TlsGate *TlsGateUp(void) { return Up_; }
+__attribute__((noinline)) static Waker *CurWaker(void) {
+    return Waker_ ? Waker_ : &ThreadWaker_;
+}
  
+/* The edge to a thread. It lives on the heap of the parent, in the layer that
+ * holds the hook which shuts the thread down: it is released with the thread,
+ * and until then a late Knock of the parent finds a closed inbox. */
 typedef struct {
-    Gate G;
+    End P,C;                                /* the parent's end, the child's end */
+    Waker CW;                               /* the child thread's */
     pthread_t Tid;
     int Joined;                             /* the parent only */
     unsigned StackSize;
     TlsGateEntry *Entry;
-    TlsGate *Parent;
-} ThreadGate;
+} ThreadEdge;
  
 static void ThreadBoot(void *arg) {
-    ThreadGate *t = arg;
-    x_(t->Entry,Entry,t->Parent);
-}
- 
-/* The thread is over: what nobody served is refused, what arrives later too. */
-static void Drain(Gate *g) {
-    GateShutdown(&g->TlsGate);
-    while (g->Ready) {
-        TlsGateNod *n = g->Ready;
-        g->Ready = n->Next;
-        n->Next = 0;
-        Release(n,EndShut);
-    }
+    ThreadEdge *t = arg;
+    x_(t->Entry,Entry,&t->C.TlsGate);
 }
  
 static void *ThreadMain(void *arg) {
-    ThreadGate *t = arg;
+    ThreadEdge *t = arg;
     TlsMemPool *B = TlsMemPoolBuffered(SharedPool_,GateBuffer);
     TlsStack *s = TlsStackOpen(B,GateHeapGrowth,0);
     TlsHeap *h = TlsStackHeap(s);
     TlsGateNod home;
     x_(h,Set);
-    Self_ = &t->G.TlsGate;
+    Up_ = &t->C.TlsGate;
+    Waker_ = &t->CW;
     TlsGateHomeRun(&home,t->StackSize,ThreadBoot,t);
-    Drain(&t->G);
-    Self_ = 0;
+    ShutInbox(&t->C);                       /* the thread is over: nothing more is served ... */
+    DrainReady(&t->C);
+    ShutInbox(&t->P);                       /* ... and the parent sees the end of its edge */
+    Up_ = 0;
+    Waker_ = 0;
     x_(h,Set);                              /* the heap head is stale: make it the root's */
     TlsHeapClose(h);                        /* all the blocks go back to the buffer ... */
     x_(B,Close);                            /* ... and the buffer gives them back to the shared pool */
@@ -354,16 +413,19 @@ static void *ThreadMain(void *arg) {
 }
  
 static void ThreadShutdown(TlsGate *this);
-/* Registered in the stack of the parent: popping the layer that holds the gate
+/* Registered in the stack of the parent: popping the layer that holds the edge
  * shuts the thread down, newest first, so children go before their parents. */
 static void ThreadHook(void *arg) {
-    ThreadGate *t = arg;
-    ThreadShutdown(&t->G.TlsGate);
+    ThreadEdge *t = arg;
+    ThreadShutdown(&t->P.TlsGate);
 }
+/* The parent's end: closes the edge, both ways, and waits for the thread. */
 static void ThreadShutdown(TlsGate *this) {
-    TlsGetThat(ThreadGate,G.TlsGate);
+    TlsGetThat(ThreadEdge,P.TlsGate);
     assert(!pthread_equal(pthread_self(),that->Tid) && "a thread cannot shut its own gate down");
-    GateShutdown(this);
+    ShutInbox(&that->C);
+    ShutInbox(&that->P);
+    DrainReady(&that->P);                   /* pulled by the parent, never invited: refused */
     if (!that->Joined) {
         pthread_join(that->Tid,0);
         that->Joined = 1;
@@ -371,25 +433,26 @@ static void ThreadShutdown(TlsGate *this) {
 }
  
 TlsGate *TlsGateSet(int StackSize,TlsGateEntry *Entry) {
-    static struct TlsGate Static = {ThreadShutdown,GateKnock,GateCheck,GateWait,GateInvite};
-    ThreadGate *t;
+    static struct TlsGate ParentStatic = {ThreadShutdown,GateKnock,GateCheck,GateWait,GateInvite};
+    static struct TlsGate ChildStatic = {GateShutdown,GateKnock,GateCheck,GateWait,GateInvite};
+    ThreadEdge *t;
     assert(SharedPool_ && "TlsGateSharedSet must be called before TlsGateSet");
     TlsHeapAlign(16);
     rPush(t);
-    t->G.TlsGate.Static = &Static;
-    atomic_init(&t->G.Head,0);
-    atomic_init(&t->G.Seq,0);
-    atomic_init(&t->G.Sleeping,0);
-    t->G.Ready = 0;
+    t->P.TlsGate.Static = &ParentStatic;
+    t->C.TlsGate.Static = &ChildStatic;
+    atomic_init(&t->CW.Seq,0);
+    atomic_init(&t->CW.Sleeping,0);
+    EndInit(&t->P,&t->C,CurWaker());
+    EndInit(&t->C,&t->P,&t->CW);
     t->Joined = 0;
     t->StackSize = StackSize;
     t->Entry = Entry;
-    t->Parent = Self_;
     if (pthread_create(&t->Tid,0,ThreadMain,t)) {
         x_(&TlsCritErrorShutdown,Signal,"Cannot create a thread.");
         abort();
     }
     TlsHeapHook(ThreadHook,t);
-    return &t->G.TlsGate;
+    return &t->P.TlsGate;
 }
  

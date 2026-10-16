@@ -281,7 +281,7 @@ static void ServerPulled(void *a) {
     TlsGateGuest *r;
     (void)a;
     while (x_(G,Check)<1) SimYield();       /* pulled */
-    while (!(atomic_load(&((Gate *)G)->Head)==SHUT)) SimYield();
+    while (!(atomic_load(&((End *)G)->Head)==SHUT)) SimYield();
     r = x_(G,Invite);                       /* after the shutdown */
     CHECK(r);
     TlsGateGuestSendOff(r);

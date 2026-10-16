@@ -37,9 +37,9 @@
  |      program allocates from it (it is given to TlsGateSharedSet);
  |   3. the heap of the main thread, on a TlsMemPoolBuffered over the shared
  |      pool, exactly like the heap of a thread made by TlsGateSet;
- |   4. a gate for the main thread (TlsGateOpen), declared with TlsGateSelfSet,
- |      so that TlsGateSelf() is never NULL and threads spawned by TlsMain get
- |      it as their Parent;
+ |   4. nothing for gates: the main thread is the root of the tree of threads and
+ |      has no gate above it (TlsGateUp() is NULL); the threads TlsMain spawns
+ |      with TlsGateSet are its children, and it holds the parent ends;
  |   5. TlsMain itself, as the first process of the main thread: on its own
  |      execution stack (Stack bytes) and on a heap forked from the root one
  |      (see TlsGateHomeRun). It is the current heap: rPush works at once.
@@ -76,3 +76,4 @@ extern const TlsMainConfig TlsMainConfigApp;
 int TlsMainRun(const TlsMainConfig *cfg,int argc,char **argv,int (*app)(int argc,char **argv));
  
 #endif
+ 

@@ -1,6 +1,8 @@
 /* Real threads: gate threads over a Shared pool, each with its own Buffered pool.
  * A merged client process must run on the thread of the server, and be back on
- * its own thread when the request is over. */
+ * its own thread when the request is over. The threads form a tree, a gate is
+ * the edge between a parent and a child, and a thread only talks to its parent
+ * and its children: the clients of a server are its children (or its parent). */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,41 +28,72 @@ static long Tid(void) { return syscall(SYS_gettid); }
  
 typedef struct { TlsGateGuest G; int Arg,Res; long Tid; } Msg;
  
-/*---- server: serves calls "Res = 2*Arg" to the merged client; Arg<0 ends ----*/
-typedef struct { TlsGateEntry E; long Tid; atomic_int Served; TlsGate *Self; TlsGate *Parent; } ServerEntry;
-static void ServerFn(TlsGateEntry *this,TlsGate *Parent) {
+struct ClientEntry;
+/*---- server: serves calls "Res = 2*Arg" to the merged client; Arg<0 ends.
+ * It serves its Up (the parent as a client) and the ends of its own children
+ * (Nc clients it spawns, whose Up is the other end). Force: when its Up is shut
+ * it ends at once, children or not; else it waits for the children to end. ----*/
+#define NCMAX 8
+typedef struct {
+    TlsGateEntry E;
+    long Tid; atomic_int Served;
+    TlsGate *Up;
+    struct ClientEntry *Clients; int Nc;
+    int Force;
+} ServerEntry;
+static void ServeOne(ServerEntry *se,TlsGateGuest *r) {
+    TlsGateGuest *c;
+    TlsStackNod *l;
+    Msg s;
+    l = TlsHeapLayer();
+    c = TlsGateGuestSwitch(r,&s.G);
+    while (c) {
+        Msg *q = (Msg *)c;
+        int *m;
+        if (q->Arg<0) { TlsGateGuestSendOff(&q->G); break; }
+        rnPush(m,4);                        /* the server heap is the one in use here */
+        m[0] = q->Arg;
+        q->Res = 2*m[0];
+        q->Tid = Tid();
+        c = TlsGateGuestSwitch(&q->G,&s.G);
+    }
+    TlsHeapLayerPop(l);
+    atomic_fetch_add(&se->Served,1);
+}
+static void SpawnClients(ServerEntry *se,TlsGate **e,int *n);
+static void ServerFn(TlsGateEntry *this,TlsGate *Up) {
     ServerEntry *se = (ServerEntry *)this;
-    TlsGate *self = TlsGateSelf();
+    TlsGate *e[1+NCMAX];
+    int n = 0,i,upShut = 0;
     se->Tid = Tid();
-    se->Self = self;
-    se->Parent = Parent;
-    while (x_(self,Wait)) {
-        TlsGateGuest *r = x_(self,Invite),*c;
-        TlsStackNod *l;
-        Msg s;
-        if (!r) continue;
-        l = TlsHeapLayer();
-        c = TlsGateGuestSwitch(r,&s.G);
-        while (c) {
-            Msg *q = (Msg *)c;
-            int *m;
-            if (q->Arg<0) { TlsGateGuestSendOff(&q->G); break; }
-            rnPush(m,4);                    /* the server heap is the one in use here */
-            m[0] = q->Arg;
-            q->Res = 2*m[0];
-            q->Tid = Tid();
-            c = TlsGateGuestSwitch(&q->G,&s.G);
+    se->Up = Up;
+    CHECK(TlsGateUp()==Up);
+    e[n++] = Up;
+    SpawnClients(se,e,&n);
+    for (;;) {
+        TlsGateGuest *r;
+        i = TlsGateWaitAny(e,n);
+        if (i>=0) {
+            r = x_(e[i],Invite);
+            if (r) ServeOne(se,r);
+            continue;
         }
-        TlsHeapLayerPop(l);
-        atomic_fetch_add(&se->Served,1);
+        for (i=0;i<n;) {                    /* drop the ends that are shut */
+            if (TlsGateIsShut(e[i])) {
+                if (e[i]==Up) upShut = 1;
+                e[i] = e[--n];
+            } else i++;
+        }
+        if (upShut && (se->Force || n==0)) break;
+        if (n==0) break;
     }
 }
 static struct TlsGateEntry ServerStatic = {ServerFn};
  
 /*---- client ----*/
-typedef struct {
+typedef struct ClientEntry {
     TlsGateEntry E;
-    TlsGate *Server;
+    TlsGate *Server;                        /* where it knocks: its Up, but for the main thread */
     ServerEntry *SE;
     int Reps;                               /* 0: until refused */
     atomic_int Done,Refused;
@@ -102,78 +135,79 @@ static void ClientCalls(ClientEntry *ce,int id) {
     TlsHeapLayerPop(layer);
     atomic_fetch_add(&ce->Done,1);
 }
-static void ClientFn(TlsGateEntry *this,TlsGate *Parent) {
+static void ClientFn(TlsGateEntry *this,TlsGate *Up) {
     ClientEntry *ce = (ClientEntry *)this;
     int j,id = (int)((Tid()>>2)&0xFF);
-    (void)Parent;
+    ce->Server = Up;
     if (ce->Reps) { for (j=0;j<ce->Reps;j++) ClientCalls(ce,id+j); }
     else { while (!atomic_load(&ce->Refused)) ClientCalls(ce,id++); }
 }
 static struct TlsGateEntry ClientStatic = {ClientFn};
  
+static void SpawnClients(ServerEntry *se,TlsGate **e,int *n) {
+    int i;
+    ClientEntry *c = se->Clients;
+    for (i=0;i<se->Nc;i++) e[(*n)++] = TlsGateSet(32768,&c[i].E);   /* the parent ends: ours */
+}
+ 
 #define NC 4
-/*---- A: many clients, plus the main thread, over one server ----*/
+/*---- A: a server thread, its NC children and the main thread as clients ----*/
 static void TestA(void) {
     ServerEntry se = {{&ServerStatic}};
     ClientEntry ce[NC],mc;
-    TlsGate *sg,*cg[NC];
+    TlsGate *sg;
     int i,j,reps = 400;
     atomic_init(&se.Served,0);
+    memset(ce,0,sizeof(ce));
+    for (i=0;i<NC;i++) { ce[i].E.Static = &ClientStatic; ce[i].SE = &se; ce[i].Reps = reps; }
+    se.Clients = ce; se.Nc = NC;
     sg = TlsGateSet(32768,&se.E);
-    for (i=0;i<NC;i++) {
-        memset(&ce[i],0,sizeof(ce[i]));
-        ce[i].E.Static = &ClientStatic; ce[i].Server = sg; ce[i].SE = &se; ce[i].Reps = reps;
-        cg[i] = TlsGateSet(32768,&ce[i].E);
-    }
     memset(&mc,0,sizeof(mc));
     mc.E.Static = &ClientStatic; mc.Server = sg; mc.SE = &se; mc.Reps = reps;
-    for (j=0;j<reps;j++) ClientCalls(&mc,1000+j);   /* the main thread is a client too */
-    for (i=0;i<NC;i++) x_(cg[i],Shutdown);          /* joins them */
-    x_(sg,Shutdown);
+    for (j=0;j<reps;j++) ClientCalls(&mc,1000+j);   /* the main thread is a client too, as the parent */
+    x_(sg,Shutdown);                        /* the server ends once its children have */
     for (i=0;i<NC;i++) CHECK(atomic_load(&ce[i].Done)==reps && atomic_load(&ce[i].Refused)==0);
     CHECK(atomic_load(&mc.Done)==reps);
     CHECK(atomic_load(&se.Served)==(NC+1)*reps);
+    CHECK(TlsGatePeer(se.Up)==sg && TlsGatePeer(sg)==se.Up);
     printf("A: %d requests over real threads, merged code ran on the server thread: ok\n",(NC+1)*reps);
 }
  
-/*---- B: shutdown while clients knock in a loop ----*/
+/*---- B: the server is removed while its children knock in a loop ----*/
 static void TestB(void) {
     ServerEntry se = {{&ServerStatic}};
     ClientEntry ce[NC];
-    TlsGate *sg,*cg[NC];
+    TlsGate *sg;
     int i,total = 0;
     atomic_init(&se.Served,0);
+    memset(ce,0,sizeof(ce));
+    for (i=0;i<NC;i++) { ce[i].E.Static = &ClientStatic; ce[i].SE = &se; ce[i].Reps = 0; }
+    se.Clients = ce; se.Nc = NC; se.Force = 1;
     sg = TlsGateSet(32768,&se.E);
-    for (i=0;i<NC;i++) {
-        memset(&ce[i],0,sizeof(ce[i]));
-        ce[i].E.Static = &ClientStatic; ce[i].Server = sg; ce[i].SE = &se; ce[i].Reps = 0;
-        cg[i] = TlsGateSet(32768,&ce[i].E);
-    }
     usleep(100000);
-    x_(sg,Shutdown);                        /* refuses, the server ends, joined */
-    for (i=0;i<NC;i++) x_(cg[i],Shutdown);  /* the clients end when refused */
+    x_(sg,Shutdown);                        /* the server ends, then its children are refused and joined */
     for (i=0;i<NC;i++) { CHECK(atomic_load(&ce[i].Refused)==1); total += atomic_load(&ce[i].Done); }
     CHECK(total==atomic_load(&se.Served) && total>0);
     CHECK(atomic_load(&TinyN)>=2*total);
-    printf("B: shutdown amid %d served requests, every client refused or served: ok\n",total);
+    printf("B: removal amid %d served requests, every client refused or served: ok\n",total);
 }
  
 /*---- C: a thread that spawns a thread, and calls it ----*/
-typedef struct { TlsGateEntry E; ServerEntry *Child; TlsGate *ChildGate; TlsGate *Self,*SawParent; long Tid; } MidEntry;
-static void MidFn(TlsGateEntry *this,TlsGate *Parent) {
+typedef struct { TlsGateEntry E; ServerEntry *Child; TlsGate *ChildGate; TlsGate *Up; long Tid; int EdgeOk; } MidEntry;
+static void MidFn(TlsGateEntry *this,TlsGate *Up) {
     MidEntry *me = (MidEntry *)this;
     ClientEntry ce;
     ServerEntry *c = me->Child;
     atomic_init(&c->Served,0);
-    me->Self = TlsGateSelf();
+    me->Up = Up;
     me->Tid = Tid();
-    me->SawParent = Parent;
-    me->ChildGate = TlsGateSet(32768,&c->E);        /* its Parent is the gate of this thread */
+    me->ChildGate = TlsGateSet(32768,&c->E);        /* an edge between this thread and the child */
     memset(&ce,0,sizeof(ce));
     ce.Server = me->ChildGate; ce.SE = c;
     ClientCalls(&ce,3);
     ClientCalls(&ce,4);
     CHECK(atomic_load(&ce.Done)==2);
+    me->EdgeOk = (TlsGatePeer(c->Up)==me->ChildGate);   /* while the edge lives: it dies with the child */
     x_(me->ChildGate,Shutdown);                     /* children go first */
 }
 static struct TlsGateEntry MidStatic = {MidFn};
@@ -185,35 +219,34 @@ static void TestC(void) {
     mid.E.Static = &MidStatic; mid.Child = &child;
     mg = TlsGateSet(32768,&mid.E);
     x_(mg,Shutdown);                                /* the middle thread returns on its own */
-    CHECK(mid.Self==mg && mid.SawParent==0);
-    CHECK(child.Parent==mid.Self && child.Self==mid.ChildGate);
+    CHECK(TlsGatePeer(mid.Up)==mg);                 /* the two ends of the edge main-mid */
+    CHECK(mid.EdgeOk);                              /* and of the edge mid-child, on the heap of mid */
     CHECK(atomic_load(&child.Served)==2);
-    printf("C: nested thread, Parent and Self gates, children shut down first: ok\n");
+    printf("C: nested thread, one edge per thread, children shut down first: ok\n");
 }
  
 /*---- D: layer pop shuts the threads down, children first, nobody calls Shutdown ----*/
 static atomic_int EndedN,ChildEnded;
-static void IdleFn(TlsGateEntry *this,TlsGate *Parent) {
-    TlsGate *self = TlsGateSelf();
-    (void)this; (void)Parent;
-    while (x_(self,Wait)) {
-        TlsGateGuest *r = x_(self,Invite);
+static void IdleFn(TlsGateEntry *this,TlsGate *Up) {
+    (void)this;
+    while (x_(Up,Wait)) {
+        TlsGateGuest *r = x_(Up,Invite);
         if (r) TlsGateGuestSendOff(r);
     }
     atomic_fetch_add(&EndedN,1);
 }
 static struct TlsGateEntry IdleStatic = {IdleFn};
-static void ParentFn(TlsGateEntry *this,TlsGate *Parent) {
+static void ParentFn(TlsGateEntry *this,TlsGate *Up) {
     TlsGateEntry *grand;
-    TlsGate *self = TlsGateSelf(),*g;
-    (void)this; (void)Parent;
+    TlsGate *g;
+    (void)this;
     TlsHeapAlign(16);
     rPush(grand);                           /* on the heap, not in this frame: the thread is joined after we return */
     grand->Static = &IdleStatic;
     g = TlsGateSet(32768,grand);            /* never shut down here */
     (void)g;
-    while (x_(self,Wait)) {
-        TlsGateGuest *r = x_(self,Invite);
+    while (x_(Up,Wait)) {
+        TlsGateGuest *r = x_(Up,Invite);
         if (r) TlsGateGuestSendOff(r);
     }
     atomic_fetch_add(&EndedN,1);            /* the grand child is joined after this, when our heap closes */
@@ -235,16 +268,55 @@ static void TestD(void) {
     printf("D: layer pop shut down 4 threads and a grand child: ok\n");
 }
  
+/*---- E: the child has ended: the edge is still there, closed, until the parent removes it ----*/
+static void QuitFn(TlsGateEntry *this,TlsGate *Up) { (void)this; (void)Up; }
+static struct TlsGateEntry QuitStatic = {QuitFn};
+static void TestE(void) {
+    TlsGateEntry quit = {&QuitStatic};
+    TlsGate *g = TlsGateSet(32768,&quit);
+    Msg req;
+    while (!TlsGateIsShut(g)) usleep(1000); /* its end of the edge: the thread is over */
+    CHECK(x_(g,Knock,&req.G)==&TlsGateEndShutdown.Guest);   /* a late knock is refused, not lost */
+    CHECK(x_(g,Check)==0);
+    x_(g,Shutdown);                         /* joins and releases */
+    printf("E: a late Knock on an ended thread is refused: ok\n");
+}
+ 
+/*---- F: the child shuts its own end: the parent's Knock is refused ----*/
+static atomic_int Closed,Leave;
+static void ByeFn(TlsGateEntry *this,TlsGate *Up) {
+    (void)this;
+    x_(Up,Shutdown);
+    atomic_store(&Closed,1);
+    while (!atomic_load(&Leave)) usleep(1000);
+}
+static struct TlsGateEntry ByeStatic = {ByeFn};
+static void TestF(void) {
+    TlsGateEntry bye = {&ByeStatic};
+    TlsGate *g;
+    Msg req;
+    atomic_store(&Closed,0); atomic_store(&Leave,0);
+    g = TlsGateSet(32768,&bye);
+    while (!atomic_load(&Closed)) usleep(1000);
+    CHECK(x_(g,Knock,&req.G)==&TlsGateEndShutdown.Guest);
+    atomic_store(&Leave,1);
+    x_(g,Shutdown);
+    printf("F: a child that shuts its end is not served any more: ok\n");
+}
+ 
 /*---- main ----*/
 static MPPool *MP;
 static TlsMemPool *Shared;
 static void MainProc(void *arg) {
     TlsStackNod *l;
     (void)arg;
+    CHECK(TlsGateUp()==0);                  /* the main thread is the root of the tree */
     l = TlsHeapLayer(); TestA(); TlsHeapLayerPop(l);
     l = TlsHeapLayer(); TestB(); TlsHeapLayerPop(l);
     l = TlsHeapLayer(); TestC(); TlsHeapLayerPop(l);
     TestD();
+    l = TlsHeapLayer(); TestE(); TlsHeapLayerPop(l);
+    l = TlsHeapLayer(); TestF(); TlsHeapLayerPop(l);
 }
 int main(void) {
     TlsMemPool *B;
