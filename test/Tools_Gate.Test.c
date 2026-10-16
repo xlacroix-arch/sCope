@@ -1,43 +1,12 @@
 /* Fiber-only test of the gates: "threads" are cooperative contexts of one OS
  * thread, run by a round robin scheduler. The implementation is included to
  * replace the blocking primitive by a yield. */
-#include <Tools_Core.h>
-#include "Tools_Gate.h"
-#include <fiber.h>
-#include <stdatomic.h>
-#include <stddef.h>
+#include "Tools_Gate.c"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
  
 #define CHECK(c) do { if (!(c)) { printf("FAILED line %d: %s\n",__LINE__,#c); exit(1); } } while (0)
  
-typedef struct Gate Gate;
-struct TlsGateNod {
-    fiber f;
-    TlsGateGuest *Guest;                    /* the mailbox: what the resumer passes */
-    TlsGateNod *Next;                       /* link in the inbox of a gate */
-    Gate *Out;                              /* request to hand over, for P */
-    atomic_uint Word;                       /* 1: P must resume the client process */
-    int Side;
-    void (*BootFn)(void *);
-    void *BootArg;
-};
-struct Gate {
-    TlsGate TlsGate;
-    _Atomic(TlsGateNod *) Head;             /* inbox, newest first; SHUT once shut */
-    atomic_uint Seq;                        /* changes at each arrival */
-    TlsGateNod *Ready;                      /* server only: pulled, oldest first */
-};
-#define SHUT ((TlsGateNod *)1)
-
-typedef struct {
-    void (*Block)(atomic_uint *w,unsigned expected);
-    void (*Wake)(atomic_uint *w);
-} GateSync;
-extern const GateSync *SyncOps;
-extern __thread TlsGateNod *Home_;
-
 /*---- scheduler ----*/
 typedef struct SimT SimT;
 struct SimT {

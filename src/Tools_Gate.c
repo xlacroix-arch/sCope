@@ -35,7 +35,7 @@ static void FutexWake(atomic_uint *w) {
     syscall(SYS_futex,w,FUTEX_WAKE_PRIVATE,1,0,0,0);
 }
 static const GateSync FutexSync = {FutexBlock,FutexWake};
-const GateSync *SyncOps = &FutexSync;
+static const GateSync *SyncOps = &FutexSync;
  
 /*_____________________________________________________________________________
  |
@@ -65,6 +65,7 @@ struct Gate {
     TlsGate TlsGate;
     _Atomic(TlsGateNod *) Head;             /* inbox, newest first; SHUT once shut */
     atomic_uint Seq;                        /* changes at each arrival */
+    atomic_uint Sleeping;                   /* the server is about to sleep on Seq, or does */
     TlsGateNod *Ready;                      /* server only: pulled, oldest first */
 };
 #define SHUT ((TlsGateNod *)1)
@@ -72,7 +73,7 @@ struct Gate {
 TlsGateEnd TlsGateEndShutdown = {{0},1};
 #define EndShut (&TlsGateEndShutdown.Guest)
  
-__thread TlsGateNod *Home_;
+static __thread TlsGateNod *Home_;
  
 unsigned TlsGateHomeSize(void) { return sizeof(TlsGateNod); }
  
@@ -150,7 +151,9 @@ static void Publish(Gate *g,TlsGateNod *n) {
     } while (!atomic_compare_exchange_weak_explicit(&g->Head,&h,n,
                 memory_order_release,memory_order_relaxed));
     atomic_fetch_add_explicit(&g->Seq,1,memory_order_release);
-    SyncOps->Wake(&g->Seq);
+    atomic_thread_fence(memory_order_seq_cst);          /* pairs with the one in Wait */
+    if (atomic_load_explicit(&g->Sleeping,memory_order_relaxed))
+        SyncOps->Wake(&g->Seq);             /* a busy server is not woken */
 }
  
 static void HomeBoot(fiber *parent) {
@@ -242,9 +245,15 @@ static int GateWait(TlsGate *this) {
         if (Pull(that)) return 1;
         if (atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) return 0;
         s = atomic_load_explicit(&that->Seq,memory_order_acquire);
-        if (Pull(that)) return 1;           /* arrived since the first look */
-        if (atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) return 0;
+        atomic_store_explicit(&that->Sleeping,1,memory_order_relaxed);
+        atomic_thread_fence(memory_order_seq_cst);      /* either the publisher sees Sleeping, or we see its request */
+        if (Pull(that) ||
+            atomic_load_explicit(&that->Head,memory_order_acquire)==SHUT) {
+            atomic_store_explicit(&that->Sleeping,0,memory_order_relaxed);
+            return Pull(that);              /* arrived since the first look, or shut */
+        }
         SyncOps->Block(&that->Seq,s);
+        atomic_store_explicit(&that->Sleeping,0,memory_order_relaxed);
     }
 }
  
@@ -280,6 +289,7 @@ TlsGate *TlsGateOpen(void) {
     g->TlsGate.Static = &Static;
     atomic_init(&g->Head,0);
     atomic_init(&g->Seq,0);
+    atomic_init(&g->Sleeping,0);
     g->Ready = 0;
     return &g->TlsGate;
 }
@@ -342,6 +352,13 @@ static void *ThreadMain(void *arg) {
     return 0;
 }
  
+static void ThreadShutdown(TlsGate *this);
+/* Registered in the stack of the parent: popping the layer that holds the gate
+ * shuts the thread down, newest first, so children go before their parents. */
+static void ThreadHook(void *arg) {
+    ThreadGate *t = arg;
+    ThreadShutdown(&t->G.TlsGate);
+}
 static void ThreadShutdown(TlsGate *this) {
     TlsGetThat(ThreadGate,G.TlsGate);
     assert(!pthread_equal(pthread_self(),that->Tid) && "a thread cannot shut its own gate down");
@@ -361,6 +378,7 @@ TlsGate *TlsGateSet(int StackSize,TlsGateEntry *Entry) {
     t->G.TlsGate.Static = &Static;
     atomic_init(&t->G.Head,0);
     atomic_init(&t->G.Seq,0);
+    atomic_init(&t->G.Sleeping,0);
     t->G.Ready = 0;
     t->Joined = 0;
     t->StackSize = StackSize;
@@ -370,6 +388,7 @@ TlsGate *TlsGateSet(int StackSize,TlsGateEntry *Entry) {
         x_(&TlsCritErrorShutdown,Signal,"Cannot create a thread.");
         abort();
     }
+    TlsHeapHook(ThreadHook,t);
     return &t->G.TlsGate;
 }
  

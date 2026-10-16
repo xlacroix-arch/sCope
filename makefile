@@ -37,8 +37,6 @@ obj/fiber.o : $(Tools_h) fiber.h
 obj/fiber_test.o : fiber.h $(Tools_h)
 
 
-Tools_Gate.Test : Tools_Core.h obj/Tools_Gate.Test.o $(Tools_o)
-	gcc -o Tools_Gate.Test obj/Tools_Gate.Test.o $(Tools_o)
 Tools_Gate.Thread.Test : Tools_Core.h obj/Tools_Gate.Thread.Test.o $(Tools_o)
 	gcc -o Tools_Gate.Thread.Test obj/Tools_Gate.Thread.Test.o $(Tools_o)
 Tools_MemPoolFilters.Test : Tools_Core.h obj/Tools_MemPoolFilters.Test.o $(Tools_o)
@@ -54,7 +52,7 @@ fiber_test : obj/fiber_test.o $(Tools_o)
 
 .PHONY : all
 all : $(Tools_o) \
-Tools_Core.Test Tools_List.Test fiber_test Tools_Fiber_test Tools_MemPoolFilters.Test Tools_Gate.Thread.Test Tools_Gate.Test
+Tools_Core.Test Tools_List.Test fiber_test Tools_MemPoolFilters.Test Tools_Gate.Thread.Test
 
 .PHONY : clean
 clean:

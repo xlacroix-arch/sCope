@@ -65,14 +65,23 @@ typedef struct {
     int Reps;                               /* 0: until refused */
     atomic_int Done,Refused;
 } ClientEntry;
+static atomic_int TinyN;
+static void Tiny(TlsFiber *parent) {
+    atomic_fetch_add(&TinyN,1);
+    TlsFiberSwitch(parent);
+    atomic_fetch_add(&TinyN,1);
+}
 static void ClientCalls(ClientEntry *ce,int id) {
     long me = Tid();
     Msg req,q;
+    TlsFiber tf;
+    TlsStackNod *layer = TlsHeapLayer();    /* taken at home, popped at home */
     TlsGateGuest *sv = x_(ce->Server,Knock,&req.G);
     int *mine,i,n = 1+id%4;
-    if (sv==&TlsGateEndShutdown.Guest) { atomic_fetch_add(&ce->Refused,1); return; }
+    if (sv==&TlsGateEndShutdown.Guest) { atomic_fetch_add(&ce->Refused,1); TlsHeapLayerPop(layer); return; }
     CHECK(sv);
     CHECK(ON(ce->SE->Tid));                 /* merged: this code now runs on the server thread */
+    CHECK(TlsFiberLaunch(16384,Tiny,&tf));  /* a fiber born on the server thread ... */
     rnPush(mine,32);                        /* allocated on the client heap, from the server thread */
     for (i=0;i<32;i++) mine[i] = id*1000+i;
     for (i=0;i<n;i++) {
@@ -88,6 +97,9 @@ static void ClientCalls(ClientEntry *ce,int id) {
     }
     CHECK(ON(me));                          /* and home again */
     for (i=0;i<32;i++) CHECK(mine[i]==id*1000+i);
+    TlsFiberSwitch(&tf);                    /* ... that ends on the home thread */
+    CHECK(tf.SwitchNod==0);
+    TlsHeapLayerPop(layer);
     atomic_fetch_add(&ce->Done,1);
 }
 static void ClientFn(TlsGateEntry *this,TlsGate *Parent) {
@@ -142,6 +154,7 @@ static void TestB(void) {
     for (i=0;i<NC;i++) x_(cg[i],Shutdown);  /* the clients end when refused */
     for (i=0;i<NC;i++) { CHECK(atomic_load(&ce[i].Refused)==1); total += atomic_load(&ce[i].Done); }
     CHECK(total==atomic_load(&se.Served) && total>0);
+    CHECK(atomic_load(&TinyN)>=2*total);
     printf("B: shutdown amid %d served requests, every client refused or served: ok\n",total);
 }
  
@@ -178,6 +191,50 @@ static void TestC(void) {
     printf("C: nested thread, Parent and Self gates, children shut down first: ok\n");
 }
  
+/*---- D: layer pop shuts the threads down, children first, nobody calls Shutdown ----*/
+static atomic_int EndedN,ChildEnded;
+static void IdleFn(TlsGateEntry *this,TlsGate *Parent) {
+    TlsGate *self = TlsGateSelf();
+    (void)this; (void)Parent;
+    while (x_(self,Wait)) {
+        TlsGateGuest *r = x_(self,Invite);
+        if (r) TlsGateGuestSendOff(r);
+    }
+    atomic_fetch_add(&EndedN,1);
+}
+static struct TlsGateEntry IdleStatic = {IdleFn};
+static void ParentFn(TlsGateEntry *this,TlsGate *Parent) {
+    TlsGateEntry *grand;
+    TlsGate *self = TlsGateSelf(),*g;
+    (void)this; (void)Parent;
+    TlsHeapAlign(16);
+    rPush(grand);                           /* on the heap, not in this frame: the thread is joined after we return */
+    grand->Static = &IdleStatic;
+    g = TlsGateSet(32768,grand);            /* never shut down here */
+    (void)g;
+    while (x_(self,Wait)) {
+        TlsGateGuest *r = x_(self,Invite);
+        if (r) TlsGateGuestSendOff(r);
+    }
+    atomic_fetch_add(&EndedN,1);            /* the grand child is joined after this, when our heap closes */
+    atomic_store(&ChildEnded,atomic_load(&EndedN));
+}
+static struct TlsGateEntry ParentStatic = {ParentFn};
+static void TestD(void) {
+    TlsStackNod *l = TlsHeapLayer();
+    TlsGateEntry idle = {&IdleStatic},par = {&ParentStatic};
+    TlsGate *g[4];
+    Msg req;
+    int i;
+    atomic_store(&EndedN,0);
+    for (i=0;i<3;i++) g[i] = TlsGateSet(32768,&idle);
+    g[3] = TlsGateSet(32768,&par);
+    for (i=0;i<4;i++) CHECK(x_(g[i],Knock,&req.G)==0);   /* all of them answer */
+    TlsHeapLayerPop(l);                     /* joins all of them, the grand child too */
+    CHECK(atomic_load(&EndedN)==5);
+    printf("D: layer pop shut down 4 threads and a grand child: ok\n");
+}
+ 
 /*---- main ----*/
 static MPPool *MP;
 static TlsMemPool *Shared;
@@ -187,6 +244,7 @@ static void MainProc(void *arg) {
     l = TlsHeapLayer(); TestA(); TlsHeapLayerPop(l);
     l = TlsHeapLayer(); TestB(); TlsHeapLayerPop(l);
     l = TlsHeapLayer(); TestC(); TlsHeapLayerPop(l);
+    TestD();
 }
 int main(void) {
     TlsMemPool *B;
@@ -211,3 +269,4 @@ int main(void) {
     printf("all passed\n");
     return 0;
 }
+ 

@@ -15,27 +15,27 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-
+ 
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <assert.h>
 #include <Tools_Core.h>
-
+ 
 struct c_loc {
     struct {
         struct {
-            char Layer,Block,Stack;
+            char Layer,Block,Stack,Hook;
         } Type;
     } Stack;
 };
-
+ 
 #define MemMinBlockSize 0x100
 #define MemAtomShift 6
 #define MemAtomAlignVal (1<<MemAtomShift)
 #define MemAtomAlign(v) (((v)+MemAtomAlignVal-1)&(-MemAtomAlignVal))
 #define NodAlign 8      /* internal nodes (layer/block/stack) are 8 aligned */
-
+ 
 static int CritErrorExit(TlsSignalString *this,char *Msg) {
     (void)this;
     fprintf(stderr,"Critical Error: %s\n",Msg);
@@ -43,7 +43,7 @@ static int CritErrorExit(TlsSignalString *this,char *Msg) {
 }
 static struct TlsSignalString CritErrorExitStatic = {CritErrorExit};
 TlsSignalString TlsCritErrorShutdown = {&CritErrorExitStatic};
-
+ 
 /*_____________________________________________________________________________
  |
  | no MemPools
@@ -62,7 +62,7 @@ TlsSignalString TlsCritErrorShutdown = {&CritErrorExitStatic};
  | Closing the pool frees that block, and so the stack itself.
  |_____________________________________________________________________________
 */
-
+ 
 struct noPool;
 typedef struct noBucket {
     TlsMemPool TlsMemPool;
@@ -169,7 +169,7 @@ static TlsMemPool *NoMemPoolNew(void **chunk,void **base,int sz,int hdr) {
     *chunk = b;
     return &r->Root.TlsMemPool;
 }
-
+ 
 /*_____________________________________________________________________________
  |
  | TlsStackNod
@@ -182,17 +182,11 @@ static TlsMemPool *NoMemPoolNew(void **chunk,void **base,int sz,int hdr) {
  | The chunks are chained from the newest to the oldest too, thru p.
  |_____________________________________________________________________________
 */
-
-#ifndef NDEBUG
-/* Debug: fibers launched and not yet ended or abandoned on this thread (see
- * Tools_Fiber.c). A layer records it, and popping the layer checks that no
- * fiber launched since is still alive: its stack and heap would be freed. */
-__thread int TlsFiberLive_;
-#endif
+ 
 struct TlsStackNod {
     unsigned int next;
 #ifndef NDEBUG
-    int Live;
+    int Live;       /* the stack's Live count when the layer was pushed */
 #endif
 };
 typedef struct {
@@ -213,13 +207,18 @@ struct TlsStack {
     TlsMemPool *Chunks;         /* the bucket of the chunks */
     struct { unsigned int sz; TlsMemPool *h; } Blk;   /* last bucket used for blocks */
     TlsIntCounter *MemWatch;
+    /* Fibers launched on this stack and not yet ended or abandoned (see
+     * Tools_Fiber.c). A layer records it, and popping the layer checks that no
+     * fiber launched since is still alive: its stack and heap would be freed.
+     * It is per stack, so that it stays right when fibers change thread. */
+    int Live;
     struct {
         StackChunk *Chunk;
         unsigned int offset;
     } Top;
 };
 #define StackNodOffset(s,n) ((unsigned int)(((char *)(n))-((char *)(s)->Top.Chunk)))
-
+ 
 typedef struct {
     TlsStackNod next;
     void *base;
@@ -229,7 +228,12 @@ typedef struct {
     TlsStackNod next;
     TlsStack *Stack;
 } ChunkPartStack;
-
+typedef struct {
+    TlsStackNod next;
+    void (*fn)(void *);
+    void *arg;
+} ChunkPartHook;
+ 
 static void StackHeapSet(TlsHeap *this) {
     TlsGetThat(TlsStack,TlsHeap);
     void *b=that->Top.Chunk;
@@ -261,6 +265,7 @@ static struct TlsHeap StackHeapStatic = {
 };
 TlsHeap *TlsStackHeap(TlsStack *s) { return &s->TlsHeap; }
 TlsMemPool *TlsStackPool(TlsStack *s) { return s->Pool; }
+int *TlsStackLive(TlsStack *s) { return &s->Live; }
 /* SizeSelect is costly on real pools: blocks of a same size in a row (the usual
  * case) share the handle found last. */
 static TlsMemPool *StackBlockBucket(TlsStack *s,unsigned int sz) {
@@ -278,10 +283,11 @@ static void StackInit(TlsStack *Stack,TlsMemPool *Pool,TlsMemPool *Chunks,unsign
     Stack->Chunks = Chunks;
     Stack->Blk.sz = 0; Stack->Blk.h = 0;
     Stack->MemWatch = MemWatch;
+    Stack->Live = 0;
     Stack->Top.Chunk = &StackChunkEnd;
     Stack->Top.offset = growth;
 }
-
+ 
 /* The chunks hold the stack's own structures (headers, links, nodes): the one
  * thing the stack asks of a pool is chunks aligned for them. Blocks, which only
  * hold user data, may have any alignment. */
@@ -291,7 +297,7 @@ static void *StackChunkCheck(void *b) {
 }
 static void StackGrow(TlsStack *s);
 static void *StackPushBlock(TlsStack *Stack,unsigned int sz);
-
+ 
 void *TlsPush(TlsStack *that,unsigned int sz) {
     void *b,*e,*p;
     b = that->Top.Chunk; e = b+that->growth; p=b+that->Top.offset;
@@ -345,7 +351,21 @@ TlsStack *TlsStackFork(TlsStack *Root) {
     StackNodPack(Root->Top.Chunk->Elts,r_o);
     return r->Stack;
 }
-
+ 
+/* A hook is a node like the others: released in reverse push order by the layer
+ * pop, it calls fn(arg). */
+void TlsStackHook(TlsStack *Root,void (*fn)(void *),void *arg) {
+    ChunkPartHook *r;
+    xpdStackNod r_o;
+    r = PushNod(Root,sizeof(*r));
+    r_o.type = c_(loc,Stack.Type,Hook);
+    r_o.next = StackNodOffset(Root,&r->next);
+    r->fn = fn;
+    r->arg = arg;
+    r->next.next = Root->Top.Chunk->Elts.next;
+    StackNodPack(Root->Top.Chunk->Elts,r_o);
+}
+ 
 typedef struct StackRoot {
     TlsStack TlsStack;
     void (*PoolClose)(struct StackRoot *Rt);
@@ -406,7 +426,7 @@ void TlsStackClose(TlsStack *Stck) {
     x_(MemWatch,Add,-(int)Stck->growth);
     Rt->PoolClose(Rt);
 }
-
+ 
 static void StackGrow(TlsStack *s) {
     TlsIntCounter *MemWatch=s->MemWatch;
     x_(MemWatch,Add,s->growth>>MemAtomShift);
@@ -420,7 +440,7 @@ static void StackGrow(TlsStack *s) {
     s->Top.Chunk = c;
     s->Top.offset = p-b;
 }
-
+ 
 /* Release the nodes of the top chunk down to End. Returns 1 if End is not in
  * this chunk (everything in it has been released, the chunk itself is left to
  * the caller), 0 if End was in it (it is then the new top, End included, popped). */
@@ -452,6 +472,10 @@ static int StackChunkReleased(TlsStack *s,struct TlsStackNod *End) {
             ChunkPartStack *ps = v_(ChunkPartStack,next,n);
             TlsStackClose(ps->Stack);
         } break;
+        case c_(loc,Stack.Type,Hook): {
+            ChunkPartHook *ph = v_(ChunkPartHook,next,n);
+            ph->fn(ph->arg);
+        } break;
         default: x_(&TlsCritErrorShutdown,Signal,"Stack unalloc: unknown type."); break;
         }
         elt.v=*n;
@@ -467,7 +491,7 @@ static int StackChunkReleased(TlsStack *s,struct TlsStackNod *End) {
 int TlsStackLayerPop(TlsStack *s,TlsStackNod *End) {
 #ifndef NDEBUG
     /* <= and not ==: a fiber launched before the layer may end inside it */
-    assert(TlsFiberLive_<=End->Live && "popping a layer that still holds a live fiber");
+    assert(s->Live<=End->Live && "popping a layer that still holds a live fiber");
 #endif
     while (s->Top.Chunk!=&StackChunkEnd) {
         StackChunk *chunk;
@@ -482,7 +506,7 @@ int TlsStackLayerPop(TlsStack *s,TlsStackNod *End) {
     s->Top.offset = s->growth;
     return 0;
 }
-
+ 
 TlsStackNod *TlsStackLayer(TlsStack *Stack) {
     struct TlsStackNod *r;
     xpdStackNod n;
@@ -490,13 +514,13 @@ TlsStackNod *TlsStackLayer(TlsStack *Stack) {
     r = PushNod(Stack,sizeof(*r));
     r->next = Stack->Top.Chunk->Elts.next;
 #ifndef NDEBUG
-    r->Live = TlsFiberLive_;
+    r->Live = Stack->Live;
 #endif
     n.next = StackNodOffset(Stack,r);
     StackNodPack(Stack->Top.Chunk->Elts,n);
     return r;
 }
-
+ 
 static void *StackPushBlock(TlsStack *Stack,unsigned int sz) {
     ChunkPartBlock *r;
     xpdStackNod n;
@@ -514,7 +538,7 @@ static void *StackPushBlock(TlsStack *Stack,unsigned int sz) {
     StackNodPack(Stack->Top.Chunk->Elts,n);
     return r->base;
 }
-
+ 
 /*_____________________________________________________________________________
  |
  | Heap Buffer
@@ -553,7 +577,7 @@ TlsHeap *TlsBufferHeap(void *b,void *e) {
     r->p = b; r->e = e;
     return &r->TlsHeap;
 }
-
+ 
 /*_____________________________________________________________________________
  |
  | Null Heap: the heap installed when there is none, so that TlsHeap_.Tgt is
@@ -579,15 +603,15 @@ static struct TlsHeap NullHeapStatic = {
     NullHeapSet,NullHeapSync,NullHeapOvf,NullHeapGetStack
 };
 static TlsHeap NullHeap = {&NullHeapStatic};
-
+ 
 /*_____________________________________________________________________________
  |
  | Heap
  |_____________________________________________________________________________
 */
-
+ 
 __thread struct TlsHeapHead TlsHeap_={&NullHeap,0,0};
-
+ 
 static void HeapAlignP(unsigned int Align) {
     uintptr_t v = (uintptr_t)TlsHeap_.p;
     v = (v+(Align-1))&~(uintptr_t)(Align-1);
@@ -603,7 +627,7 @@ void TlsHeapAlign(unsigned int Align) {
         HeapAlignP(Align);
     }
 }
-
+ 
 TlsStackNod *TlsHeapLayer(void) {
     TlsStack *s = x_(TlsHeap_.Tgt,GetStack);
     x_(TlsHeap_.Tgt,Sync);
@@ -627,6 +651,13 @@ TlsHeap *TlsHeapFork(void) {
     x_(TlsHeap_.Tgt,Set);
     return r;
 }
+/* fn(arg) will be called when the layer holding this call is popped. */
+void TlsHeapHook(void (*fn)(void *),void *arg) {
+    TlsStack *s = x_(TlsHeap_.Tgt,GetStack);
+    x_(TlsHeap_.Tgt,Sync);
+    TlsStackHook(s,fn,arg);
+    x_(TlsHeap_.Tgt,Set);
+}
 /* Only for a heap that was opened as a root (not a forked one, which is closed
  * by the layer pop that pops its parent). */
 void TlsHeapClose(TlsHeap *Heap) {
@@ -634,7 +665,7 @@ void TlsHeapClose(TlsHeap *Heap) {
     if (TlsHeap_.Tgt==Heap) x_(&NullHeap,Set);
     TlsStackClose(s);
 }
-
+ 
 void TlsMainHeapOpen(int growth) {
     TlsStack *s = TlsStackOpen(0,growth,&TlsIntCounterNull);
     TlsHeap *hp = TlsStackHeap(s);
@@ -646,3 +677,4 @@ void TlsMainHeapClose(void) {
     x_(&NullHeap,Set);
     TlsStackClose(s);
 }
+ 

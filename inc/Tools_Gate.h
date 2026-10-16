@@ -94,8 +94,14 @@ unsigned TlsGateHomeSize(void);             /* room for a TlsGateNod */
  |   * ends when Entry returns. Requests that are still waiting are then refused.
  | Shutdown on a thread gate refuses the requests as usual, then waits for the
  | thread to end (so Entry must return once Wait says 0), and releases it.
- | It must be called by the parent, before the heap layer that holds the gate
- | is popped, and not by the thread itself.
+ | It is also done by itself when the heap layer that holds the gate is popped
+ | (a hook in the stack of the parent), newest first: a thread is shut down
+ | before the thread that spawned it, whose own pop shuts its children. The
+ | hook runs while the stack is being released: whatever the thread uses from
+ | the parent heap, the Entry object included, must have been pushed before
+ | TlsGateSet and must outlive the thread: put it on the heap (rPush), not in
+ | the frame of a function that may return before the join. Shutdown can still
+ | be called earlier, by the parent only.
  |_____________________________________________________________________________
  */
 TlsClassDef(TlsGateEntry) {

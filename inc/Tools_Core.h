@@ -15,14 +15,14 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-
+ 
 #ifndef _Tools_Core_h_
 #define _Tools_Core_h_
-
+ 
 #include <Tools_Class.h>
-
+ 
 int TlsLog2(unsigned int v);
-
+ 
 /*_____________________________________________________________________________
  |
  | Signals are used to allow software components to react to certain
@@ -32,7 +32,7 @@ int TlsLog2(unsigned int v);
  | exiting the program.
  |_____________________________________________________________________________
 */
-
+ 
 TlsClassDef(TlsSignal) {
     int (*Signal)(TlsSignal *this);
 };
@@ -42,12 +42,12 @@ TlsClassDef(TlsSignalInt){
 TlsClassDef(TlsSignalString){
     int (*Signal)(TlsSignalString *this,char *Msg);
 };
-
+ 
 TlsSignal *TlsSignalMessage(TlsSignalString *Tgt,char *Msg);
-
+ 
 extern TlsSignalString TlsCritErrorShutdown;
 extern TlsSignal *TlsCritErrorOutOfMemory;
-
+ 
 /*_____________________________________________________________________________
  |
  | Signals are used to allow software components to react to certain
@@ -57,23 +57,23 @@ extern TlsSignal *TlsCritErrorOutOfMemory;
  | exiting the program.
  |_____________________________________________________________________________
 */
-
+ 
 TlsClassDef(TlsIntCounter) {
     int (*Add)(TlsIntCounter *this,int val);
     int (*Set)(TlsIntCounter *this,int val);
 };
-
+ 
 extern TlsIntCounter TlsIntCounterNull;
 TlsIntCounter *TlsIntCounterDirect(int val);
 TlsIntCounter *TlsIntCounterAccumulate(TlsIntCounter *Acc,int val);
 TlsIntCounter *TlsIntCounterWatch(TlsIntCounter *Tgt,int threshold,TlsSignal *signal);
-
+ 
 /*_____________________________________________________________________________
  |
  | Memory management: we have stacks and pools.
  |_____________________________________________________________________________
 */
-
+ 
 /*_____________________________________________________________________________
  |
  | Mempool: a pool hands out memory in buckets (sizes classes). Several
@@ -114,14 +114,7 @@ TlsClassDef(TlsMemPool) {
     void (*Close)(TlsMemPool *this);
     TlsIntCounter *(*CountSwitch)(TlsMemPool *this,TlsIntCounter *Swp);
 };
-
-/* Specialisations and filters: */
-
-/* Make a child Pool thread safe to use: */
-TlsMemPool *TlsMemPoolShared(TlsMemPool *child);
-/* Buffer items instead of releasing them, to limit access to the child*/
-TlsMemPool *TlsMemPoolBuffered(TlsMemPool *child,unsigned int buffersize);
-
+ 
 /*_____________________________________________________________________________
  |
  | Stack:
@@ -134,7 +127,7 @@ TlsMemPool *TlsMemPoolBuffered(TlsMemPool *child,unsigned int buffersize);
  | TlsStackOpen() and TlsStackClose() create and release a stack.
  |_____________________________________________________________________________
 */
-
+ 
 typedef struct TlsStack TlsStack;
 typedef struct TlsStackNod TlsStackNod;
 void *TlsPush(TlsStack *Stack,unsigned int sz);
@@ -144,8 +137,16 @@ TlsStackNod *TlsStackLayer(TlsStack *Stack);
 int TlsStackLayerPop(TlsStack *s,TlsStackNod *End);
 TlsStack *TlsStackOpen(TlsMemPool *Pool,unsigned int growth,TlsIntCounter *Watch);
 TlsMemPool *TlsStackPool(TlsStack *s); /* the root pool the stack was opened with */
+/* The stack's live fiber counter (see Fiber management): fibers launched on
+ * a heap of this stack and not yet ended or abandoned. It follows the stack,
+ * not the thread, so fibers may cross threads (see Tools_Gate.h). */
+int *TlsStackLive(TlsStack *s);
+/* Hook: fn(arg) is called when the layer holding it is popped (or the stack
+ * is closed), in the reverse order of the pushes, like blocks are freed and
+ * forked stacks closed. A hook must not push on the stack it is released from. */
+void TlsStackHook(TlsStack *s,void (*fn)(void *),void *arg);
 void TlsStackClose(TlsStack *Stck);
-
+ 
 /*_____________________________________________________________________________
  |
  | Creation of object is typically done on pushing them on the Heap via
@@ -163,7 +164,7 @@ void TlsStackClose(TlsStack *Stck);
  | and then reupdate the heap pointer via a call to TlsHeapResync();
  |_____________________________________________________________________________
 */
-
+ 
 TlsClassDef(TlsHeap) {
     void (*Set)(TlsHeap *this);
     void (*Sync)(TlsHeap *this);
@@ -181,13 +182,14 @@ TlsStackNod *TlsHeapLayer(void);
 int TlsHeapLayerPop(TlsStackNod *l);
 TlsHeap *TlsHeapFork(void);
 void TlsHeapClose(TlsHeap *Heap);
+void TlsHeapHook(void (*fn)(void *),void *arg);   /* TlsStackHook on the current heap */
 #define rPush(v) { v=TlsHeap_.p; TlsHeap_.p=v+1;\
     if((TlsHeap_.e-TlsHeap_.p)<0){v = x_(TlsHeap_.Tgt,Ovf,v);}\
 }
 #define rnPush(v,n) { v=TlsHeap_.p; TlsHeap_.p=v+n;\
     if((TlsHeap_.e-TlsHeap_.p)<0){v = x_(TlsHeap_.Tgt,Ovf,v);}\
 }
-
+ 
 #define TlsHeapIn(_nHeap_) { \
     TlsHeap *_oHeap_; \
     x_(TlsHeap_.Tgt,Sync); _oHeap_ = TlsHeap_.Tgt; x_(_nHeap_,Set);
@@ -196,13 +198,13 @@ void TlsHeapClose(TlsHeap *Heap);
 }
 void TlsMainHeapOpen(int growth);
 void TlsMainHeapClose(void);
-
+ 
 /*________________________________________________________________________
  |
  | Extra components
  |________________________________________________________________________
 */
-
+ 
 typedef struct TlsBNod TlsBNod;
 #define TlsBNodEnd ((TlsBNod *)(0))
 TlsClassDef(TlsBNodProcess){
@@ -234,7 +236,7 @@ TlsBTree *Tls31RadixInit(TlsBTreeRoot *r,int NodSz);
 as well as the associated Nod. returns &TlsBNodEnd if nothing is found. */
 TlsBNod *TlsBNodGetLowest(TlsBTree *rt,unsigned int *from);
 TlsBNod *TlsBNodGetHighest(TlsBTree *rt,unsigned int *from);
-
+ 
 /*________________________________________________________________________
  |
  |  Fiber management:
@@ -282,19 +284,21 @@ TlsBNod *TlsBNodGetHighest(TlsBTree *rt,unsigned int *from);
  |  * The slot of the fiber, its nod, its stack and its heap all live in the
  | block of the launcher: popping a layer (TlsHeapLayerPop) while a fiber
  | launched inside it is still parked is an error. In debug builds, a live
- | fiber counter is compared at each layer pop to catch most of these cases.
+ | fiber counter, kept per stack (TlsStackLive), is compared at each layer pop
+ | to catch most of these cases.
  |  * Each fiber owns its Heap: The running Heap is synced before 
  | TlsFiberSwitch call and is Set after it returns.
  | Only the fiber itself may layer, fork or pop its own heap.
  |________________________________________________________________________
 */
-
+ 
 typedef struct TlsFiberNod TlsFiberNod;
 typedef struct { TlsFiberNod *SwitchNod; } TlsFiber;
-
+ 
 TlsFiber *TlsFiberLaunch(unsigned stack_sz, void (*entry)(TlsFiber *parent), TlsFiber *org);
 TlsFiber *TlsFiberSwitch(TlsFiber *next);
 void      TlsFiberNodMove(TlsFiber *dst, TlsFiber *src);
 void      TlsFiberAbandon(TlsFiber *slot);   /* discard a parked, unfinished fiber */
-
+ 
 #endif
+ 
