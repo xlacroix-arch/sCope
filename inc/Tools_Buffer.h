@@ -19,27 +19,29 @@
 #ifndef _Tools_Buffer_h_
 #define _Tools_Buffer_h_
 
-#include <Tool_Class.h>
+#include <Tools_Class.h>
 
 /*_____________________________________________________________________________
  |
  | Buffer0 usage: use p as a pointer to read data sequentially.
  |    Use Check0 when a specific condition (typically a 0) is read.
- | On the end of stream, Check0 will return 0, else the buffer will be update
- | and the new pointer will be returned.
+ | On the end of stream, Check0 will return a empty string, else the buffer will 
+ | be update and the new pointer will be returned.
  | If Buffer0 is pointing in a file, the file will be automatically closed at
  | the end.
+ |
+ | All new items are pushed on the heap.
  |_____________________________________________________________________________
 */
 
-#define TlsEob0 -1
-#define TlsEof0 -2
+extern unsigned char const TlsBufferEob[], const TlsBufferEof[];
+
 typedef struct {
     struct TlsBuffer0 *Static;
     unsigned char *p;
 } TlsBuffer0;
 struct TlsBuffer0 {
-    int (*Check0)(TlsBuffer0 *this,unsigned char *pos);
+    unsigned char *(*Check0)(TlsBuffer0 *this,unsigned char *pos);
     unsigned char *(*Reset)(TlsBuffer0 *this);
     void (*Close)(TlsBuffer0 *this);
 };
@@ -53,15 +55,15 @@ TlsBuffer0 *TlsFileBuffer(char *FileName);
 
 TlsBuffer0 *TlsBufferCat(TlsBuffer0 **a,int n);
 TlsBuffer0 *TlsBufferCat0(TlsBuffer0 *a,...);
-TlsBuffer0 *TlsBufferReplace(TlsBuffer *Base,TlsBuffer *Edit,int b,int e);
+TlsBuffer0 *TlsBufferReplace(TlsBuffer0 *Base,TlsBuffer0 *Edit,int b,int e);
 
 TlsClassDef(TlsBuffMacro) {
-    int *(ParamNumber)(TlsBuffMacro *this);
-    TlsBuffer *(*Apply)(TlsBuffMacro *this,TlsBuffer **Var);
-}
+    int *(*ParamNumber)(TlsBuffMacro *this);
+    TlsBuffer0 *(*Apply)(TlsBuffMacro *this,TlsBuffer0 **Var);
+};
 TlsClassDef(TlsBuffMacroDef) {
     void (*AddSubstitution)(TlsBuffMacroDef *this,int b,int e,int ParamNum);
-    TlsBuffMacro *(Generate)(TlsBuffMacroDef *this);
+    TlsBuffMacro *(*Generate)(TlsBuffMacroDef *this);
 };
 
 #endif

@@ -84,8 +84,8 @@ struct TlsDList { TlsDList *p,*n; };
  |     ThisToThat declares a pointer on the specialised object "that",
  | which should contain the specialised fields.
  | 
- | x_(o,m,...) invokes the objects o methods m. Be careful because the
- |    o will be evaluated twice.
+ | x_(o,m,...) invokes the objects o methods m. 
+ |    !!! Be careful because the o will be evaluated twice. !!!
  |_______________________________________________________________________
 */
 
