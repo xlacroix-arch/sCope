@@ -1,6 +1,7 @@
 **/obj
 **/lib
 **.swp
+*.Test
 /fiber_test
 /Tools_Core.Test
 /Tools_Fiber_test

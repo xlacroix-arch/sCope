@@ -1,5 +1,5 @@
 /*  Fondement Michtam
- *  Copyright (C) 2026 Xavier Lacroix, Coded by Claude Sonnet 5.5
+ *  Copyright (C) 2026 Xavier Lacroix
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -55,7 +55,7 @@ static void TestContract(void) {
     CntInit(&cnt);
     R = TlsMemPoolShared(TlsMainPoolOpen(&cnt.TlsIntCounter));
     CHECK(x_(R,BucketSize)==0);
-    CHECK(x_(R,SizeSelect,0)==R || x_(x_(R,SizeSelect,0),BucketSize)==0);
+    { TlsMemPool *z = x_(R,SizeSelect,0); CHECK(z==R || x_(z,BucketSize)==0); }
     for (i=0;i<5000;i++) {
         unsigned int sz = PickSize(&r);
         h = x_(R,SizeSelect,sz);
@@ -178,6 +178,26 @@ static void TestBuffered(void) {
     CHECK(TlsMemPoolSharedLocks(S)==l0);
     for (i=0;i<1000;i++) x_(h,Free,P[i],64);
  
+    {   void *p = x_(h,Allocate);                           /* Free thru the root: the sizes are cached, no lock */
+        x_(B,Free,p,64);                                    /* (the first one may learn the size) */
+        l0 = TlsMemPoolSharedLocks(S);
+        for (i=0;i<20000;i++) { p = x_(h,Allocate); x_(B,Free,p,64); }
+        CHECK(TlsMemPoolSharedLocks(S)==l0);
+    }
+    {   TlsMemPool *g = x_(B,SizeSelect,1000),*s48 = x_(B,SizeSelect,48);   /* a refill that must flush first: one access */
+        unsigned int bs = x_(s48,BucketSize),n = 0;
+        void *p;
+        for (i=0;i<64;i++) P[i] = x_(g,Allocate);
+        while (n<64 && TlsMemPoolBufferedHeld(B)+127*bs<=budget) x_(g,Free,P[n++],1000);
+        CHECK(n<64 && TlsMemPoolBufferedHeld(B)+127*bs>budget && TlsMemPoolBufferedHeld(B)<=budget);
+        l0 = TlsMemPoolSharedLocks(S);
+        p = x_(s48,Allocate);
+        CHECK(TlsMemPoolSharedLocks(S)-l0==1);
+        CHECK(TlsMemPoolBufferedHeld(B)<=budget/2+127*bs);  /* it did flush */
+        x_(s48,Free,p,48);
+        while (n<64) x_(g,Free,P[n++],1000);
+    }
+ 
     big = x_(B,SizeSelect,20000);                           /* above a quarter of the buffer: not buffered */
     l0 = TlsMemPoolSharedLocks(S);
     for (i=0;i<100;i++) { void *p = x_(big,Allocate); x_(big,Free,p,20000); }
@@ -186,7 +206,7 @@ static void TestBuffered(void) {
         memset(p,1,8);
         x_(B,Free,p,3);
         p = x_(h,Allocate);
-        x_(x_(B,SizeSelect,5000),Free,p,64);
+        { TlsMemPool *o = x_(B,SizeSelect,5000); x_(o,Free,p,64); }
     }
     CHECK(own.Val==0);
     x_(B,Close);                                            /* gives the held blocks back */
@@ -220,4 +240,4 @@ int main(void) {
     printf("all passed\n");
     return 0;
 }
-
+ 

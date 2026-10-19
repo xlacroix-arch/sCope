@@ -1,5 +1,5 @@
 /*  Fondement Michtam
- *  Copyright (C) 2026 Xavier Lacroix, Coded by Claude Sonnet 5.5
+ *  Copyright (C) 2026 Xavier Lacroix
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -50,6 +50,8 @@
  |      the pool, or a handle of it, while it is closed.
  |    - Every Allocate/Free costs a lock round trip: that is what Buffered is
  |      for.
+ |    - TlsMemPoolSharedLocks counts the lock round trips; it is read without
+ |      the lock, so it is for tests, once the other threads are done.
  |
  | BUFFERED. A front for ONE thread (it is not thread safe by itself: one
  | Buffered per thread, over a Shared) that keeps free blocks of the buckets
@@ -60,6 +62,10 @@
  |    - to flush the buffer when it holds too much, in a single access too.
  | buffersize is the bytes of free blocks the buffer may hold, all buckets
  | counted together; it is never exceeded.
+ |    - SizeSelect, and the Free of a block thru a handle that is not the one
+ |      of its size (the root, say), are answered from a small cache of the
+ |      sizes already seen (64 entries): they reach the child only the first
+ |      time a size is met, or after a collision of the cache.
  |    - A batch is a quarter of the buffer (at least 2 blocks, at most
  |      BatchMax); a flush goes down to half of it: so a thread that allocates
  |      or frees in a steady state enters the child once every
@@ -258,6 +264,8 @@ TlsMemPool *TlsMemPoolShared(TlsMemPool *child) {
     P->Root = SWrap(P,child);
     return &P->Root->B.TlsMemPool;
 }
+/* Test only: the count is read without the lock, so call it when no other
+ * thread uses the pool (after a join, say). */
 unsigned long TlsMemPoolSharedLocks(TlsMemPool *this) {
     TlsGetThat(SBucket,B.TlsMemPool);
     return that->P->L.n;
@@ -290,6 +298,7 @@ typedef struct {
     uint32_t Batch;                         /* blocks per refill; 0: not buffered */
     uint32_t SzOk;                          /* last size checked to belong to this bucket */
 } BBucket;
+#define SzCacheN 64                         /* direct mapped cache: size -> bucket */
 struct BPool {
     Dir D;
     TlsMemPool *Child;
@@ -297,6 +306,7 @@ struct BPool {
     uint64_t Budget,Held;                   /* bytes */
     TlsIntCounter *Count;
     BBucket *Root;
+    struct { uint32_t Sz; BBucket *B; } Cache[SzCacheN];
 };
  
 static struct TlsMemPool BufferedStatic;
@@ -334,8 +344,27 @@ static BBucket *BWrap(BPool *P,TlsMemPool *ch) {
     return b;
 }
  
+/* The bucket of a size, found in the cache of the pool when it has been asked
+ * before: Free thru the root, or thru a handle of another size, then does not
+ * reach the child (a Shared would lock). Relies on SizeSelect not depending on
+ * the handle it is asked to, nor changing its answer. Sizes below a link are
+ * those of the 8 bytes bucket. A collision only costs one more SizeSelect. */
+static BBucket *BSelect(BBucket *from,unsigned int sz) {
+    BPool *P = from->P;
+    BBucket *b;
+    unsigned i;
+    if (sz && sz<MinBlock) sz = MinBlock;
+    i = (unsigned)(((uint32_t)sz*2654435761u)>>26);     /* 6 bits: SzCacheN */
+    if (P->Cache[i].B && P->Cache[i].Sz==sz) return P->Cache[i].B;
+    b = BWrap(P,x_(from->B.Child,SizeSelect,sz));
+    P->Cache[i].Sz = sz;
+    P->Cache[i].B = b;
+    return b;
+}
+ 
 /* Gives back to the child the cached blocks of the buckets, those of `first`
- * (if not 0) before the others, until no more than `target` bytes are held. */
+ * (if not 0) before the others, until no more than `target` bytes are held.
+ * With the lock of the child held, if it has one: FlushLocked. */
 static void FlushOne(BPool *P,BBucket *b,uint64_t target) {
     while (b->Free && P->Held>target) {
         void *blk = b->Free;
@@ -345,12 +374,15 @@ static void FlushOne(BPool *P,BBucket *b,uint64_t target) {
         x_(b->Under,Free,blk,b->B.Size);
     }
 }
-static void Flush(BPool *P,BBucket *first,uint64_t target) {
+static void FlushLocked(BPool *P,BBucket *first,uint64_t target) {
     FBucket *f;
-    if (P->Held<=target) return;
-    Hold(P);                                /* one access for the whole flush */
     if (first) FlushOne(P,first,target);
     for (f=P->D.All;f && P->Held>target;f=f->All) FlushOne(P,(BBucket *)f,target);
+}
+static void Flush(BPool *P,BBucket *first,uint64_t target) {
+    if (P->Held<=target) return;
+    Hold(P);                                /* one access for the whole flush */
+    FlushLocked(P,first,target);
     Unhold(P);
 }
  
@@ -358,8 +390,8 @@ static void *Refill(BBucket *b) {
     BPool *P = b->P;
     uint32_t n = b->Batch,i;
     void *r;
-    if (P->Held+(uint64_t)(n-1)*b->B.Size>P->Budget) Flush(P,0,P->Budget/2);
-    Hold(P);
+    Hold(P);                                /* one access: the flush, if any, and the batch */
+    if (P->Held+(uint64_t)(n-1)*b->B.Size>P->Budget) FlushLocked(P,0,P->Budget/2);
     r = x_(b->Under,Allocate);
     for (i=1;i<n;i++) {
         void *q = x_(b->Under,Allocate);
@@ -393,8 +425,8 @@ static void BufferedFree(TlsMemPool *this,void *mem,unsigned int sz) {
     TlsGetThat(BBucket,B.TlsMemPool);
     BPool *P = that->P;
     if (sz!=that->B.Size && sz!=that->SzOk) {   /* maybe not the bucket of sz: let it do */
-        TlsMemPool *h = x_(this,SizeSelect,sz);
-        if (h!=this) { x_(h,Free,mem,sz); return; }
+        BBucket *h = BSelect(that,sz);
+        if (h!=that) { x_(&h->B.TlsMemPool,Free,mem,sz); return; }
         that->SzOk = sz;
     }
     x_(P->Count,Add,-(int)that->B.Size);
@@ -410,8 +442,7 @@ static void BufferedFree(TlsMemPool *this,void *mem,unsigned int sz) {
 }
 static TlsMemPool *BufferedSizeSelect(TlsMemPool *this,unsigned int sz) {
     TlsGetThat(BBucket,B.TlsMemPool);
-    if (sz && sz<MinBlock) sz = MinBlock;
-    return &BWrap(that->P,x_(that->B.Child,SizeSelect,sz))->B.TlsMemPool;
+    return &BSelect(that,sz)->B.TlsMemPool;
 }
 static unsigned int BufferedBucketSize(TlsMemPool *this) {
     TlsGetThat(BBucket,B.TlsMemPool);
@@ -463,3 +494,4 @@ unsigned long TlsMemPoolBufferedHeld(TlsMemPool *this) {
     TlsGetThat(BBucket,B.TlsMemPool);
     return (unsigned long)that->P->Held;
 }
+ 

@@ -91,8 +91,8 @@ TlsIntCounter *TlsIntCounterWatch(TlsIntCounter *Tgt,int threshold,TlsSignal *si
  |    - BucketSize(this) is the size really served by the bucket (>= the size
  |      given to SizeSelect), and SizeSelect(h,BucketSize(h)) == h.
  |      A root with not bucket of its own cannot Allocate; the 0-size bucket can.
- |    - Allocate(this) returns a block of BucketSize(this) bytes, alignment
- |      policy varies with bucket/pool type. It never returns NULL: failure 
+ |    - Allocate(this) returns a block of BucketSize(this) bytes, aligned as
+ |      the ALIGNMENT rule below says. It never returns NULL: failure
  |      is a critical error (TlsCritErrorOutOfMemory).
  |    - Free(this,mem,sz) gives mem back to the bucket it came from: sz is the
  |      size that was given to SizeSelect to get the allocating handle.
@@ -104,6 +104,18 @@ TlsIntCounter *TlsIntCounterWatch(TlsIntCounter *Tgt,int threshold,TlsSignal *si
  |      from now on, moving what was accumulated so far, and returns the
  |      previous counter. With Swp == NULL it only returns the current one.
  |    A pool is used by one thread at a time unless its constructor says so.
+ |
+ | ALIGNMENT. Every pool follows the same rule, so that a user (or another
+ | pool: the Mini pool finds the header of a page by masking an address) can
+ | count on it. A block of BucketSize s, in bytes, is aligned on
+ |    - 8 if s is a multiple of 8, else 4 if it is a multiple of 4, else 2 if
+ |      it is even (an odd size has no alignment);
+ |    - itself if s is a power of 2: a 64 bytes bucket gives blocks aligned on
+ |      64, a 4096 one gives pages. The main pool holds it up to 4 MiB; above,
+ |      its blocks are aligned on the page (4096) only.
+ |    A pool may give more (the main pool aligns on the lowest bit of the size:
+ |    48 gives 16), never less. The rule is on the size of the bucket, not on
+ |    the size asked to SizeSelect.
  |_____________________________________________________________________________
 */
 TlsClassDef(TlsMemPool) {
@@ -151,12 +163,12 @@ void TlsStackClose(TlsStack *Stck);
  |
  | Creation of object is typically done on pushing them on the Heap via
  | rPush() for an object and rnPush() for an array of object.
- | For performance purpose, we only use two pointers to locate the new object 
- | and detect overflow; so a function call is only done when an overflow is 
+ | For performance purpose, we only use two pointers to locate the new object
+ | and detect overflow; so a function call is only done when an overflow is
  | detected via, thru the Tls_HeapOverflow_() function.
- | The Heap is associated with a TlsStack. 
+ | The Heap is associated with a TlsStack.
  | It is possible to change the associated stack via TlsHeapTgtSet(); in that
- | case, the current associated stack; if any is first Synced. And the Heap is 
+ | case, the current associated stack; if any is first Synced. And the Heap is
  | made to point to the top of the new stack.
  | When doing extra stuff with the associated
  | stack (like forking, marking a layer, poping layer ...) you need to first
@@ -253,7 +265,7 @@ TlsBNod *TlsBNodGetHighest(TlsBTree *rt,unsigned int *from);
  | move to that target fiber, AND, change the target of the FiberNod to the
  | calling fiber.
  |  * TlsFiber can be tied to a FiberNod and act as handle to them. You
- | can move one FiberNod from one TlsFiber to another using 
+ | can move one FiberNod from one TlsFiber to another using
  | TlsFiberNodMove.
  |  * TlsFiberSwitch switch to the fiber targeted by the attached FiberNod.
  | They return a TlsFiber chosen by the returning fiber; which can be embedded
@@ -286,7 +298,7 @@ TlsBNod *TlsBNodGetHighest(TlsBTree *rt,unsigned int *from);
  | launched inside it is still parked is an error. In debug builds, a live
  | fiber counter, kept per stack (TlsStackLive), is compared at each layer pop
  | to catch most of these cases.
- |  * Each fiber owns its Heap: The running Heap is synced before 
+ |  * Each fiber owns its Heap: The running Heap is synced before
  | TlsFiberSwitch call and is Set after it returns.
  | Only the fiber itself may layer, fork or pop its own heap.
  |________________________________________________________________________
@@ -301,4 +313,4 @@ void      TlsFiberNodMove(TlsFiber *dst, TlsFiber *src);
 void      TlsFiberAbandon(TlsFiber *slot);   /* discard a parked, unfinished fiber */
  
 #endif
- 
+
