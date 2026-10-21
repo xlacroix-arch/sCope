@@ -174,6 +174,13 @@ void TlsStackClose(TlsStack *Stck);
  | stack (like forking, marking a layer, poping layer ...) you need to first
  | sync the heap and the Stack via a call to TlsHeapTgtSync(). Do the operation,
  | and then reupdate the heap pointer via a call to TlsHeapResync();
+ | 
+ | Alignment of heap: usually a function will push a number of variables on 
+ | Heap, it can expect to get a (void *) aligned heap and must leave the heap
+ | aligned on (void *) when it returns. This is normally not necessary to 
+ | enforce except in some cases, like when arrays of char are pushed on the 
+ | heap. In those rare cases, use TlsHeapAlign(sizeof(void *)) to realign the 
+ | heap. 
  |_____________________________________________________________________________
 */
  
@@ -198,7 +205,7 @@ void TlsHeapHook(void (*fn)(void *),void *arg);   /* TlsStackHook on the current
 #define rPush(v) { v=TlsHeap_.p; TlsHeap_.p=v+1;\
     if((TlsHeap_.e-TlsHeap_.p)<0){v = x_(TlsHeap_.Tgt,Ovf,v);}\
 }
-#define rnPush(v,n) { v=TlsHeap_.p; TlsHeap_.p=v+n;\
+#define rnPush(v,n) { v=TlsHeap_.p; TlsHeap_.p=v+(n);\
     if((TlsHeap_.e-TlsHeap_.p)<0){v = x_(TlsHeap_.Tgt,Ovf,v);}\
 }
  

@@ -35,7 +35,7 @@
 
 #define s_(t) (((void *)(((t *)0)+1))-((void *)0))
 #define sv_(v) (((void *)((v)+1))-((void *)(v)))
-#define snv_(v,n) (((void *)((v)+n))-((void *)(v)))
+#define snv_(v,n) (((void *)((v)+(n)))-((void *)(v)))
 #define o_(t,d) (((char *)(&((t *)0)->d))-((char *)0))
 #define c_(t,d,p) (((char *)(&(((struct c_##t *)0)->d.p)))-((char *)(&((struct c_##t *)0)->d)))
 #define v_(t,d,p) ((t *)(((char *)(p))-o_(t,d)))
