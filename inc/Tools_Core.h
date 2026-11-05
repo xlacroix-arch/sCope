@@ -215,8 +215,15 @@ void TlsHeapHook(void (*fn)(void *),void *arg);   /* TlsStackHook on the current
 #define TlsHeapOut \
     x_(TlsHeap_.Tgt,Sync); x_(_oHeap_,Set);\
 }
+
+#define rOpen  { TlsStackNod *__L0; __L0=TlsHeapLayer();
+#define rClose TlsHeapLayerPop(__L0); }
+
+TlsMemPool *TlsMemPoolPush(void); // Push a MemPool on the heap. It leaves entirely in its forked stack.
+
 void TlsMainHeapOpen(int growth);
 void TlsMainHeapClose(void);
+
  
 /*________________________________________________________________________
  |
